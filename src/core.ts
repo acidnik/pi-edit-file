@@ -534,7 +534,7 @@ function resolveOne(hunk: Hunk, fileLines: string[], index: number): { ok: Resol
 				`\nThe before-block contains lines starting with "+" — this looks like a unified diff. ` +
 				`The patch format is: NNN @@@ / old lines (no "-") / @@@ / new lines (no "+") — write plain line contents without +/- markers.`;
 		}
-		const suggestion = suggestCorrection(fileLines, hunk);
+		const suggestion = suggestCorrection(fileLines, hunk, hint);
 		return {
 			fail: {
 				index,
@@ -711,6 +711,7 @@ export function resolveHunks(hunks: Hunk[], fileLines: string[]): ResolvedHunk[]
 function suggestCorrection(
 	fileLines: string[],
 	hunk: Hunk,
+	hint: number | null,
 ): { text: string; patch: string } | undefined {
 	const before = hunk.before;
 	if (before.length === 0) return undefined;
@@ -720,7 +721,8 @@ function suggestCorrection(
 	const anchorIdx = before.reduce((best, l, i) => (l.trim().length > before[best].trim().length ? i : best), 0);
 	const anchors: Array<{ line: number; offset: number }> = [];
 	const starts = new Set<number>();
-	for (const offset of new Set([anchorIdx, 0])) {
+	const anchorOffsets = new Set([anchorIdx, 0]);
+	for (const offset of anchorOffsets) {
 		const needle = before[offset];
 		fileLines.forEach((line, i) => {
 			if (line === needle) {
@@ -728,6 +730,15 @@ function suggestCorrection(
 				anchors.push({ line: i, offset });
 			}
 		});
+	}
+	// Nothing matched exactly — the block is probably one typo away from a real
+	// line ("31_000" vs "30_000"). Anchor on the most similar line instead, so the
+	// model still gets a pasteable correction rather than just a hint.
+	if (starts.size === 0) {
+		for (const offset of anchorOffsets) {
+			const near = closestLine(fileLines, before[offset], hint);
+			if (near) starts.add(near.index - offset);
+		}
 	}
 
 	const scoreAt = (start: number): number => {
@@ -739,6 +750,12 @@ function suggestCorrection(
 			if (a === b) score += 1;
 			else if (a.trim() === b.trim() && b.trim() !== "") score += 0.75;
 			else if (a.replace(/\s+/g, " ").trim() === b.replace(/\s+/g, " ").trim() && b.trim() !== "") score += 0.5;
+			else {
+				// Typo-level similarity ("31_000" vs "30_000") still makes this the
+				// right region to show, even though no line matches outright.
+				const sim = lineSimilarity(a, b);
+				if (sim >= 0.7) score += 0.75 * sim;
+			}
 		}
 		return score;
 	};
@@ -752,15 +769,22 @@ function suggestCorrection(
 			bestStart = s;
 		}
 	}
-	if (bestStart < 0 || bestScore < 1) return undefined;
+	// Any real evidence is enough: one exactly matching line scores 1, and a
+	// single-line typo scores ~0.7 through the similarity credit.
+	if (bestStart < 0 || bestScore < 0.5) return undefined;
 
 	const actual = fileLines.slice(bestStart, bestStart + before.length);
-	const matched = actual.filter(
-		(a, k) => a === before[k] || a.trim() === before[k].trim() || a.replace(/\s+/g, " ").trim() === before[k].replace(/\s+/g, " ").trim(),
-	).length;
+	const matchesLoosely = (a: string, b: string) =>
+		a === b ||
+		a.trim() === b.trim() ||
+		a.replace(/\s+/g, " ").trim() === b.replace(/\s+/g, " ").trim() ||
+		lineSimilarity(a, b) >= 0.7;
+	const matched = actual.filter((a, k) => matchesLoosely(a, before[k])).length;
+	const exact = actual.filter((a, k) => a === before[k]).length;
 	const detail: string[] = [];
 	detail.push(
-		`\nClosest candidate: lines ${bestStart + 1}-${bestStart + before.length} — ${matched} of ${before.length} line(s) match.`,
+		`\nClosest candidate: lines ${bestStart + 1}-${bestStart + before.length} — ` +
+			`${matched} of ${before.length} line(s) match${exact < matched ? ` (${exact} exactly)` : ""}.`,
 	);
 	detail.push("Actual file content there:");
 	detail.push(...actual.map((l, k) => `  ${String(bestStart + k + 1).padStart(4)} | ${l === before[k] ? "=" : "≠"} ${l}`));

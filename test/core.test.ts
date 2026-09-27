@@ -627,3 +627,17 @@ test("escaping: no note when the backslash-n is genuine file content", () => {
 	}
 	assert.doesNotMatch(msg, /Escaping note/);
 });
+
+test("suggestCorrection: typo-level near miss still yields a pasteable hunk", () => {
+	const lines = toLines("head\nexport const TIMEOUT_MS = 30_000;\ntail");
+	let msg = "";
+	try {
+		runPatch("2 @@@\nexport const TIMEOUT_MS = 31_000;\n@@@\nexport const TIMEOUT_MS = 60_000;\n@@@", lines);
+	} catch (e) {
+		msg = (e as Error).message;
+	}
+	assert.match(msg, /closest line 2 \(\d+% similar\): "export const TIMEOUT_MS = 30_000;"/);
+	assert.match(msg, /Suggested corrected hunk for hunk 1:/);
+	assert.match(msg, /2 @@@\nexport const TIMEOUT_MS = 30_000;\n@@@\nexport const TIMEOUT_MS = 60_000;\n@@@/);
+});
+
