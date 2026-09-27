@@ -417,15 +417,18 @@ function rangeDistance(start: number, end: number, hint: number): number {
  * the whole file, because a matched block may contain top-level lines and would
  * otherwise skew the majority. Only reported, never rewritten — the model may
  * be re-indenting on purpose. */
+/** A JSDoc continuation line (" * text") is not evidence of space indentation. */
+const JSDOC_CONTINUATION_RE = /^\s\*[^/]/;
+
 function indentMismatch(fileLines: string[], start: number, hunk: Hunk): string | undefined {
-	const indentedAfter = hunk.after.filter((l) => l.trim() !== "" && /^\s/.test(l));
+	const indentedAfter = hunk.after.filter((l) => l.trim() !== "" && /^\s/.test(l) && !JSDOC_CONTINUATION_RE.test(l));
 	if (indentedAfter.length === 0) return undefined;
 
 	const tabsIn = (lines: string[]) => lines.filter((l) => /^\t/.test(l)).length;
 	let fileIndentedTabs = 0;
 	let fileIndentedSpaces = 0;
 	for (const line of fileLines) {
-		if (line.trim() === "" || !/^\s/.test(line)) continue;
+		if (line.trim() === "" || !/^\s/.test(line) || JSDOC_CONTINUATION_RE.test(line)) continue;
 		if (/^\t/.test(line)) fileIndentedTabs++;
 		else fileIndentedSpaces++;
 	}

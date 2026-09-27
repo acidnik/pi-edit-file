@@ -641,3 +641,14 @@ test("suggestCorrection: typo-level near miss still yields a pasteable hunk", ()
 	assert.match(msg, /2 @@@\nexport const TIMEOUT_MS = 30_000;\n@@@\nexport const TIMEOUT_MS = 60_000;\n@@@/);
 });
 
+test("indent note: JSDoc continuation lines do not count as space indentation", () => {
+	// a tab-indented file whose block is preceded by / followed by a JSDoc comment
+	const lines = toLines("/**\n * doc line\n */\nconst A = 1;\n");
+	const resolved = resolveHunks(parsePatch("4 @@@\nconst A = 1;\n@@@\nconst A = 2;\n@@@"), lines);
+	assert.equal(resolved[0].match.indentMismatch, undefined);
+
+	// the patch itself is a JSDoc block being rewritten: no note either
+	const doc = toLines("/**\n * old doc\n */\nconst A = 1;\n");
+	const patch = "1 @@@\n/**\n * old doc\n */\n@@@\n/**\n * new doc\n */\n@@@";
+	assert.equal(resolveHunks(parsePatch(patch), doc)[0].match.indentMismatch, undefined);
+});
