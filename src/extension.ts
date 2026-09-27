@@ -36,7 +36,6 @@ import {
 	sequentialDiffs,
 	truncateDiff,
 	parseUnifiedDiff,
-	wordDiffPair,
 } from "./core.ts";
 
 const TOOL_NAME = "edit_file";
@@ -355,66 +354,16 @@ function registerWriteDiff(pi: { registerTool: (t: unknown) => void }) {
  }
 
 /**
- * Background tint for a diff line, derived from the theme's own diff color.
+ * Diff line backgrounds: flat pastel tints, no theme blending.
  *
- * Built-in themes define no `backgrounds` section, so theme.bg() would throw;
- * instead we take the foreground ANSI escape (truecolor after var resolution) and
- * dim it into a dark tint, which keeps the syntax-highlighted code readable on
- * top. On 256-color terminals we fall back to a fixed dark shade of the same hue.
- * Returns undefined when the color cannot be resolved (then lines stay unshaded).
+ * Removed lines get #ffd7d7, added lines #d7ffd7 — picked for the light
+ * "light-fix" theme. The earlier implementation derived the tint from the
+ * theme's own diff colors (blended toward white on light themes, black on dark
+ * ones, with a PI_DIFF_BG_DIM knob); that is gone on purpose, so the diff looks
+ * the same in every session and nothing depends on the theme's palette.
  */
-/** Tint strength for diff line backgrounds (see diffLineBackground). */
-function diffBackgroundMix(light: boolean): number {
-	const raw = Number(process.env.PI_DIFF_BG_DIM);
-	if (Number.isFinite(raw) && raw > 0 && raw <= 1) return raw;
-	return light ? 0.38 : 0.45;
-}
-
-/**
- * Does the active theme sit on a light background? The theme's TEXT color is the
- * reliable signal: light themes use dark text (#1f2328) and dark themes light
- * text (#d4d4d4). `theme.mode` is used when present, the luminance heuristic
- * covers custom themes (e.g. "light-fix").
- */
-function themeHasLightBackground(theme: any): boolean {
-	if (theme?.mode === "light") return true;
-	if (theme?.mode === "dark") return false;
-	try {
-		const fg = theme?.getFgAnsi?.("text");
-		const tc = typeof fg === "string" ? /38;2;(\d+);(\d+);(\d+)/.exec(fg) : null;
-		if (tc) {
-			const [r, g, b] = [tc[1], tc[2], tc[3]].map(Number);
-			return 0.299 * r + 0.587 * g + 0.114 * b < 128;
-		}
-	} catch {
-		// unknown color key
-	}
-	return false;
-}
-
-function diffLineBackground(theme: any, key: string, light: boolean): string | undefined {
-	try {
-		const fg = theme?.getFgAnsi?.(key);
-		if (typeof fg !== "string") return undefined;
-		const truecolor = /38;2;(\d+);(\d+);(\d+)/.exec(fg);
-		if (truecolor) {
-			// Blend the theme's diff hue toward the background: white on a light
-			// theme, black on a dark one. A straight "dim toward black" produced
-			// near-black blocks on light terminals, hence the direction switch.
-			// PI_DIFF_BG_DIM (0..1) overrides how much hue is kept.
-			const mix = diffBackgroundMix(light);
-			const target = light ? 255 : 0;
-			const [r, g, b] = [truecolor[1], truecolor[2], truecolor[3]].map((v) =>
-				Math.round(target + (Number(v) - target) * mix),
-			);
-			return `\x1B[48;2;${r};${g};${b}m`;
-		}
-		if (/38;5;\d+/.test(fg)) return `\x1B[48;5;${light ? 224 : 52}m`;
-	} catch {
-		// unknown color key on a custom theme: fall through, no shading
-	}
-	return undefined;
-}
+const DIFF_BG_REMOVED = "\x1B[48;2;255;215;215m"; // #ffd7d7
+const DIFF_BG_ADDED = "\x1B[48;2;215;255;215m"; // #d7ffd7
 
 /**
  * Render a unified diff body with syntax highlighting.
@@ -422,10 +371,14 @@ function diffLineBackground(theme: any, key: string, light: boolean): string | u
  * Hybrid approach: the NEW file is read from disk and highlighted as a whole, so
  * added and context lines keep multi-line context (template literals, block
  * comments); removed lines no longer exist on disk and are highlighted
- * individually. A 1:1 removed/added pair gets word-level highlighting
- * (theme.inverse), the same idea as pi's own edit diff. Marker characters and
- * hunk headers keep the theme's diff colors; the code itself is never re-wrapped
- * in fg(), which would wipe the colors highlightCode already applied.
+ * individually.
+ *
+ * Coloring is line-level only: removed lines get the red tint, added lines the
+ * green one (see DIFF_BG_*). Word-level highlighting was removed on purpose —
+ * the tint plus syntax colors already say what changed, and inverting tokens
+ * fought with the syntax highlighting underneath. Marker characters and hunk
+ * headers keep the theme's diff colors; the code itself is never re-wrapped in
+ * fg(), which would wipe the colors highlightCode already applied.
  */
 function renderDiffBody(diffText: string, absPath: string | undefined, theme: any): string {
 	const hunks = parseUnifiedDiff(diffText);
@@ -451,13 +404,7 @@ function renderDiffBody(diffText: string, absPath: string | undefined, theme: an
 	};
 	const newLine = (text: string, b: number): string => newFileLines?.[b - 1] ?? hl(text);
 
-	// Line background tints (see diffLineBackground): on light themes blended
-	// toward white, on dark toward black. 256-color fallbacks: 224/194 light,
-	// 52/22 dark.
-	const lightBg = themeHasLightBackground(theme);
-	const bgRemoved = diffLineBackground(theme, "toolDiffRemoved", lightBg);
-	const bgAdded = diffLineBackground(theme, "toolDiffAdded", lightBg);
-	const shade = (bg: string | undefined, text: string): string => (bg ? `${bg}${text}\x1B[49m` : text);
+	const shade = (bg: string, text: string): string => `${bg}${text}\x1B[49m`;
 
 	const out: string[] = [];
 	for (const hunk of hunks) {
@@ -480,32 +427,17 @@ function renderDiffBody(diffText: string, absPath: string | undefined, theme: an
 				const added: string[] = [];
 				while (i < lines.length && lines[i].kind === "+") added.push(lines[i++].text);
 
-				if (removed.length === added.length && added.length > 0) {
-					for (let k = 0; k < removed.length; k++) {
-						const pair = wordDiffPair(removed[k], added[k]);
-						const oldText = pair.old
-							.map((s) => (s.changed ? theme.inverse(hl(s.text)) : hl(s.text)))
-							.join("");
-						const newText = pair.new
-							.map((s) => (s.changed ? theme.inverse(hl(s.text)) : hl(s.text)))
-							.join("");
-						out.push(shade(bgRemoved, `${theme.fg("toolDiffRemoved", "-")}${oldText}`));
-						out.push(shade(bgAdded, `${theme.fg("toolDiffAdded", "+")}${newText}`));
-						b++;
-					}
-				} else {
-					for (const text of removed) out.push(shade(bgRemoved, `${theme.fg("toolDiffRemoved", "-")}${hl(text)}`));
-					for (const text of added) {
-						out.push(shade(bgAdded, `${theme.fg("toolDiffAdded", "+")}${newLine(text, b)}`));
-						b++;
-					}
+				for (const text of removed) out.push(shade(DIFF_BG_REMOVED, `${theme.fg("toolDiffRemoved", "-")}${hl(text)}`));
+				for (const text of added) {
+					out.push(shade(DIFF_BG_ADDED, `${theme.fg("toolDiffAdded", "+")}${newLine(text, b)}`));
+					b++;
 				}
 				continue;
 			}
 
 			// Pure insertion (no preceding removals in this run).
 			while (i < lines.length && lines[i].kind === "+") {
-				out.push(shade(bgAdded, `${theme.fg("toolDiffAdded", "+")}${newLine(lines[i].text, b)}`));
+				out.push(shade(DIFF_BG_ADDED, `${theme.fg("toolDiffAdded", "+")}${newLine(lines[i].text, b)}`));
 				b++;
 				i++;
 			}
