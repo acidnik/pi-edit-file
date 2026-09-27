@@ -1,0 +1,39 @@
+{
+  "name": "pi-edit-file",
+  "version": "0.1.0",
+  "description": "Block-based atomic file editing for Pi agents: one flat patch string, precise match diagnostics, word-level diff rendering",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "edit",
+    "patch",
+    "diff",
+    "atomic-edit",
+    "block-edit",
+    "coding-agent"
+  ],
+  "type": "module",
+  "main": "./src/extension.ts",
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/core.test.ts"
+  },
+  "pi": {
+    "extensions": [
+      "./src/extension.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "license": "MIT"
+}
