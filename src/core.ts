@@ -916,7 +916,12 @@ export function formatHunkReport(r: ResolvedHunk, index: number, outFrom: number
 export function hunkDiff(original: string[], updated: string[], r: ResolvedHunk): string {
 	const ctxFrom = Math.max(0, r.start - CONTEXT);
 	const ctxTo = Math.min(original.length, r.end + CONTEXT);
-	const head = original.length === 0 ? "" : `@@ -${r.start + 1},${r.end - r.start} +${r.start + 1} @@`;
+	// Header must describe the BODY (context window), not just the hunk: the UI
+	// renderer maps body lines onto the on-disk file via the +start number, so a
+	// hunk-scoped header shifted every displayed line by the leading context.
+	const head = original.length === 0
+		? ""
+		: `@@ -${ctxFrom + 1},${ctxTo - ctxFrom} +${ctxFrom + 1},${ctxTo - ctxFrom + r.hunk.after.length - (r.end - r.start)} @@`;
 	if (r.kind === "insert" && original.length === 0) {
 		return `@@ +1 @@ (new file content)\n` + r.hunk.after.map((l) => "+" + l).join("\n");
 	}

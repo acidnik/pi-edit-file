@@ -163,14 +163,31 @@ test("WINDOW is 20 per plan", () => {
 
 test("hunkDiff: produces unified-style body with context", () => {
 	const out = runPatch("4 @@@\nalpha = 1\n@@@\nalpha = 10\n@@@", toLines(FILE));
-	assert.match(out.diff, /@@ -4,1 \+4 @@/);
+	// Header covers the context window actually shown in the body (2 lines
+	// before/after the hunk), so renderers can map body lines onto the file.
+	assert.match(out.diff, /@@ -2,5 \+2,5 @@/);
 	assert.match(out.diff, /beta = 2/); // context line
 });
 
-test("hunkDiff: insert into empty file", () => {
-	const out = runPatch("1 @@@\n@@@\nfirst\nsecond\n@@@", []);
-	assert.equal(out.totalLines, 2);
-	assert.match(out.diff, /\+first/);
+test("hunkDiff: header covers context so parsed bStart maps body lines onto the new file", () => {
+	// Regression (session 2026-09-28): the header used to be hunk-scoped
+	// ("@@ -12,1 +12 @@"), while the body started 2 context lines earlier —
+	// renderDiffBody then read the wrong on-disk lines and the displayed edit
+	// landed on completely different lines than the one actually edited.
+	const lines = Array.from({ length: 20 }, (_, i) => `line ${i + 1}`);
+	const out = runPatch("12 @@@\nline 12\n@@@\nline 12\nline twelve appended\n@@@", lines);
+	const parsed = parseUnifiedDiff(out.diff);
+	assert.equal(parsed.length, 1);
+	// What renderDiffBody reads from disk: the new file content.
+	const updated = [...lines.slice(0, 12), "line twelve appended", ...lines.slice(12)];
+	// Every context/added line must equal the new file line at its running
+	// b-number (bStart comes from the @@ header).
+	let b = parsed[0].bStart;
+	for (const l of parsed[0].lines) {
+		if (l.kind === "-") continue;
+		assert.equal(l.text.trim(), updated[b - 1], `b=${b} kind=${l.kind}`);
+		b++;
+	}
 });
 test("parse: delimiter collision (different char) errors clearly", () => {
 	assert.throws(() => parsePatch("1 @@@\n%%%\n@@@\nx\n@@@"), /collision/);
@@ -184,8 +201,9 @@ test("sequentialDiffs: context reflects earlier hunks, headers rebased", () => {
 	// hunk 1: 1→2 lines (net +1)
 	assert.match(parts[0], /\+new1\n\+extra/);
 
-	// hunk 2 header rebased by +1: in the intermediate state old2 sits at line 5
-	assert.match(parts[1], /@@ -5,1 \+5 @@/);
+	// hunk 2 header rebased by +1 and widened to its context window: in the
+	// intermediate state the window (extra, mid, old2, z) starts at line 3
+	assert.match(parts[1], /@@ -3,4 \+3,4 @@/);
 	// context around hunk 2 shows content created by hunk 1 (extra), not the original
 	assert.match(parts[1], /extra/);
 	assert.doesNotMatch(parts[1], /new1/); // 2-line context window doesn't reach line 2
