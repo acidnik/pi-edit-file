@@ -28,8 +28,10 @@ import {
 	EditError,
 	unifiedDiff,
 	type Hunk,
+	chainSkeleton,
 	formatHunkReports,
 	hunkSummary,
+	isNoOpHunk,
 	applyHunks,
 	parsePatch,
 	resolveHunks,
@@ -51,8 +53,9 @@ new line 2
 @@@
 
 - NNN: 1-based line number where the old block starts (anchor hint, not strict). It may be omitted entirely — write a bare "@@@" line as the header and the block must then match exactly once in the file (an insert still needs NNN, since it has no block to match).
+- Insert direction: an insert with "NNN @@@" goes BEFORE line NNN. To insert AFTER line NNN, write "NNN+ @@@" (the "+" goes right after the number). "NNN+ @@@" is only valid for inserts — a replace anchors the matched block itself.
 - The patch is a JSON string: one patch line is one file line. Never type "\\n" yourself — write real line breaks. Backticks, \${...} and quotes need no escaping.
-- @@@: delimiter, 3+ repetitions of one char from @ # % $ ~ ^ = +. Use the same delimiter character throughout the call; if the file content contains a line like @@@, escalate to a longer run (####) for the whole call.
+- @@@: delimiter, 3+ repetitions of one char from @ # % $ ~ ^ = +. The EXACT run from the first header is the call's delimiter on every line; a content line that equals it splits the block — escalate to a longer run (####) for the whole call (then "@@@" stays content).
 - Empty old block → insert new lines before line NNN (append at end of file if NNN is past the last line).
 - Empty new block → delete the old block.
 - Otherwise → replace the matched old block with the new block.
@@ -60,6 +63,8 @@ new line 2
 Matching (per hunk, against the ORIGINAL file content): exact block match, then trimmed lines, then whitespace-collapsed lines. Searched first within ±20 lines of NNN, then the whole file. The match nearest to NNN wins, where the distance is measured to the matched RANGE (a hint inside the block means distance 0). Two matches at the same distance → the patch is rejected as ambiguous; distinct candidates are listed in the report. All hunks must match; overlapping hunks are rejected; the whole edit is atomic — on any failure the batch is rejected as a whole and the report states the fate of every hunk (nothing is written).
 
 The report also tells you how each hunk matched, e.g. "replace src 69-72 → out 69-73 (4 → 5 lines), exact match, hint 20 off by 49 [LOW CONFIDENCE: matched outside the ±20 line window]": src = line numbers in the original file, out = in the resulting file. "also matches at lines …" warns about identical snippets elsewhere, "indentation: …" warns that the inserted lines use a different indent style than the file.
+
+A hunk whose old block exactly equals its new block (no-op) is skipped with a note; the rest of the batch applies.
 
 Concatenate multiple hunks in one patch. Example — change line 42 and append after line 120:
 
@@ -131,10 +136,32 @@ export default function editFileExtension(pi: { registerTool: (t: unknown) => vo
 				parsed = parsePatch(params.patch);
 			} catch (err) {
 				if (err instanceof EditError) {
+					if (err.code === "content-start") {
+						// The model wrote the chain form ("old @@@ new @@@ …"). Never
+						// applied as-is; translate it into a numbered skeleton and
+						// teach the format on the model's own example.
+						const skeleton = chainSkeleton(params.patch, readLines(absPath).lines);
+						throw new EditError(`patch rejected — nothing was written to the file.\n${skeleton}`);
+					}
 					throw new EditError(`patch rejected — nothing was written to the file.\n${err.message}`);
 				}
 				throw err;
 			}
+
+			// No-op hunks (before == after, exact) are skipped with a note instead
+			// of killing the batch or silently doing busywork.
+			const active: Array<{ hunk: Hunk; origIndex: number }> = [];
+			const noOpNotes: string[] = [];
+			parsed.forEach((h, i) => {
+				if (isNoOpHunk(h)) noOpNotes.push(`hunk ${i + 1}: no-op (before == after) — skipped`);
+				else active.push({ hunk: h, origIndex: i });
+			});
+			if (active.length === 0) {
+				const text = `${noOpNotes.join("\n")}\nnothing to change (all hunks are no-ops)\nfile: ${params.path} — untouched`;
+				return { content: [{ type: "text", text }], details: { path: absPath, hunks: [], reportLines: noOpNotes, totalLines: (readLines(absPath).lines.length), diff: "", diffTruncated: false } };
+			}
+			parsed = active.map((x) => x.hunk);
+			const hunkNumbers = active.map((x) => x.origIndex);
 
 			const result = await withFileMutationQueue(absPath, async () => {
 				const file = readLines(absPath);
@@ -146,9 +173,12 @@ export default function editFileExtension(pi: { registerTool: (t: unknown) => vo
 				writeFileSync(absPath, serializeLines(updated, file.crlf, file.finalNewline), "utf8");
 
 				const reports = resolved.map((r, i) => hunkSummary(r, i));
-				// src = line numbers in the original file, out = in the result file
-				const reportLines = formatHunkReports(resolved);
-				const summary = `${reportLines.join("\n")}\nsrc = original file, out = resulting file`;
+				// src = line numbers in the original file, out = in the result file;
+				// hunk numbers stay the patch's original numbering across no-op skips
+				const reportLines = formatHunkReports(resolved, hunkNumbers);
+				const summary =
+					`${[...reportLines, ...noOpNotes].join("\n")}\nsrc = original file, out = resulting file\n` +
+					`follow-up edits: use the out-numbers from this report as hints — they match the file as it is now`;
 
 				const diffText = sequentialDiffs(file.lines, resolved)
 					.filter(Boolean)

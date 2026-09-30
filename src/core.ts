@@ -29,9 +29,20 @@ export const MAX_FILE_BYTES = 5 * 1024 * 1024;
 /** Result/context cap for the model-facing diff. */
 export const MAX_DIFF_CHARS = 8000;
 
-export class EditError extends Error {}
+export class EditError extends Error {
+	/** Machine-readable failure class; "content-start" marks a patch that opens
+	 * with content where a hunk header belongs — the extension turns that into
+	 * a ready-to-paste numbered skeleton via chainSkeleton(). */
+	code?: string;
+	constructor(message: string, code?: string) {
+		super(message);
+		this.code = code;
+	}
+}
 
-const HEADER_RE = new RegExp(`^(\\d+)\\s+([${DELIM_CHARS}]{3,})\\s*$`);
+// "+" before the delimiter run = insert-after (NNN+ @@@); the space before the
+// run is now optional (NNN@@@ also parses — a whole class of header typos gone).
+const HEADER_RE = new RegExp(`^(\\d+)(\\+)?\\s*([${DELIM_CHARS}]{3,})\\s*$`);
 const DELIM_RE = new RegExp(`^([${DELIM_CHARS}])\\1{2,}\\s*$`);
 
 export interface Hunk {
@@ -42,6 +53,8 @@ export interface Hunk {
 	before: string[];
 	/** Replacement lines (empty → delete). */
 	after: string[];
+	/** Header was "NNN+ @@@": insert goes AFTER line NNN (inserts only). */
+	insertAfter?: boolean;
 }
 
 export type HunkKind = "replace" | "insert" | "delete";
@@ -77,21 +90,30 @@ export interface ResolvedHunk {
 	match: MatchInfo;
 }
 
-function delimiterChar(line: string): string | null {
+/** Full delimiter run on a line — "####" for "N ####" and bare "####", not a
+ * single char. The call's delimiter is this EXACT run: shorter runs, longer
+ * ones and repeats of another character are legal content (that is what makes
+ * the documented "escalate to a longer run" advice actually work). */
+function delimiterRun(line: string): string | null {
 	const m = DELIM_RE.exec(line);
 	if (!m) return null;
-	// DELIM_RE forces a single repeated char; sanity-guard anyway.
-	if (!new RegExp(`^[${DELIM_CHARS}]+$`).test(m[1])) return null;
-	return m[1];
+	return m[0].trim();
 }
 
-/** A hunk header: "NNN @@@", or a bare "@@@" line (hint omitted — the block
- * must then match exactly once in the file). */
-export function parseHunkHeader(line: string): { hint: number | null; delim: string } | null {
+/** A hunk header: "NNN @@@" (optional "+" = insert-after, optional space),
+ * or a bare "@@@" line (hint omitted — the block must then match exactly
+ * once in the file). */
+export function parseHunkHeader(line: string): { hint: number | null; insertAfter?: boolean; delim: string } | null {
 	const hm = HEADER_RE.exec(line);
-	if (hm) return { hint: Number.parseInt(hm[1], 10), delim: hm[2] };
-	const ch = delimiterChar(line);
-	if (ch !== null) return { hint: null, delim: ch.repeat(3) };
+	if (hm) {
+		return {
+			hint: Number.parseInt(hm[1], 10),
+			...(hm[2] === "+" ? { insertAfter: true } : {}),
+			delim: hm[3],
+		};
+	}
+	const run = delimiterRun(line);
+	if (run !== null) return { hint: null, delim: run };
 	return null;
 }
 
@@ -105,11 +127,18 @@ export function parsePatch(patch: string): Hunk[] {
 	if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
 
 	const hunks: Hunk[] = [];
-	let delimChar: string | null = null;
+	// The call's delimiter is the EXACT full-line run from its first header
+	// ("@@@@"), not "3+ of the same char": a content line "@@@" stays content
+	// when the call uses "####", so escalation actually works.
+	let delimRun: string | null = null;
 	let i = 0;
 
-	const isOwnDelim = (line: string) => delimiterChar(line) === delimChar && delimChar !== null;
+	const isOwnDelim = (line: string) => delimRun !== null && line.trim() === delimRun;
 	const hintLabel = (hint: number | null) => (hint === null ? "no NNN hint" : `hint ${hint}`);
+
+	// Chain detection: a patch whose first content line is not a header. The
+	// extension translates that error into a numbered skeleton (chainSkeleton).
+	let firstNonBlank = -1;
 
 	while (i < lines.length) {
 		// Skip blank separators between hunks.
@@ -117,26 +146,27 @@ export function parsePatch(patch: string): Hunk[] {
 			i++;
 			continue;
 		}
+		if (firstNonBlank === -1) firstNonBlank = i;
 
 		const header = parseHunkHeader(lines[i]);
 		if (!header) {
 			throw new EditError(
-				`parse error at line ${i + 1}: expected a hunk header — either "NNN @@@ " or a bare "${delimChar ?? "@@@ "}" line — got: ${JSON.stringify(lines[i])}`,
+				`parse error at line ${i + 1}: expected a hunk header — either "NNN @@@ ", "NNN+ @@@ ", or a bare "${delimRun ?? "@@@ "}" line — got: ${JSON.stringify(lines[i])}`,
+				i === firstNonBlank ? "content-start" : undefined,
 			);
 		}
 		const hint = header.hint;
 		const headerDelim = header.delim;
-		const ch = headerDelim[0];
-		if (delimChar === null) {
-			delimChar = ch;
-		} else if (ch !== delimChar) {
+		if (delimRun === null) {
+			delimRun = headerDelim;
+		} else if (headerDelim !== delimRun) {
 			throw new EditError(
-				`delimiter character mismatch: header uses "${ch}" but this call already uses "${delimChar}" — use the same delimiter character throughout`,
+				`delimiter mismatch: header uses "${headerDelim}" but this call already uses "${delimRun}" — write the same delimiter run on every header line`,
 			);
 		}
 		i++;
 
-		// Collect before-lines until a delimiter.
+		// Collect before-lines until the call's exact delimiter run.
 		const before: string[] = [];
 		const bodyStart = i;
 		while (i < lines.length && !isOwnDelim(lines[i])) {
@@ -144,20 +174,14 @@ export function parsePatch(patch: string): Hunk[] {
 			// and skipped the '@@@' delimiter between the old and new blocks.
 			if (i > bodyStart && /^\s*\+/.test(lines[i]) && before.some((l) => /^-\s?/.test(l) || /^-\s*$/.test(l))) {
 				throw new EditError(
-					`parse error at line ${i + 1}: this looks like a unified diff (-old / +new lines), but the patch format needs a "${delimChar}${delimChar}${delimChar}" delimiter between the old and new blocks:\n\n` +
-						`${hint} ${delimChar.repeat(3)}\n<old lines, no leading "-">\n${delimChar.repeat(3)}\n<new lines, no leading "+">\n${delimChar.repeat(3)}\n\n` +
+					`parse error at line ${i + 1}: this looks like a unified diff (-old / +new lines), but the patch format needs a "${delimRun}" delimiter between the old and new blocks:\n\n` +
+						`${hint}${header.insertAfter ? "+" : ""} ${delimRun}\n<old lines, no leading "-">\n${delimRun}\n<new lines, no leading "+">\n${delimRun}\n\n` +
 						`Strip the leading "-" and "+" markers and keep only the plain line contents.`,
-				);
-			}
-			const other = delimiterChar(lines[i]);
-			if (other !== null) {
-				throw new EditError(
-					`delimiter collision at line ${i + 1}: found "${lines[i].trim()}" but this call uses "${delimChar}" — ${other === delimChar ? "escalate to a longer run (e.g. " + delimChar.repeat(4) + ")" : "keep one delimiter character (" + delimChar + ") for the whole call"}`,
 				);
 			}
 			if (HEADER_RE.test(lines[i])) {
 				throw new EditError(
-					`parse error at line ${i + 1}: hunk header found before the closing delimiter — missing "@${delimChar === "@" ? "@@" : delimChar + delimChar}" separator?`,
+					`parse error at line ${i + 1}: hunk header found before the closing delimiter — missing "${delimRun}" separator?`,
 				);
 			}
 			before.push(lines[i]);
@@ -165,7 +189,7 @@ export function parsePatch(patch: string): Hunk[] {
 		}
 		if (i >= lines.length) {
 			throw new EditError(
-				`parse error: unterminated hunk (${hintLabel(hint)}) — missing closing delimiter between the old and new blocks`,
+				`parse error: unterminated hunk (${hintLabel(hint)}) — missing closing "${delimRun}" between the old and new blocks`,
 			);
 		}
 		i++; // consume the closing delimiter
@@ -177,11 +201,11 @@ export function parsePatch(patch: string): Hunk[] {
 			const line = lines[i];
 			const headerHere = parseHunkHeader(line);
 			if (headerHere && headerHere.hint !== null) break; // NNN header: next hunk starts
-			if (headerHere || isOwnDelim(line)) {
-				// A bare delimiter is either this hunk's terminator or the next
-				// hunk's hintless header. Look ahead: content right after it (that
-				// is not itself a header) means the next hunk starts here — leave
-				// the delimiter for the outer loop to read as its header.
+			if (isOwnDelim(line)) {
+				// The call's own delimiter is either this hunk's terminator or the
+				// next hunk's hintless header. Look ahead: content right after it
+				// (that is not itself a header) means the next hunk starts here —
+				// leave the delimiter for the outer loop to read as its header.
 				let j = i + 1;
 				while (j < lines.length && lines[j].trim() === "") j++;
 				const nextIsContent = j < lines.length && !parseHunkHeader(lines[j]);
@@ -190,20 +214,31 @@ export function parsePatch(patch: string): Hunk[] {
 				terminated = true;
 				break;
 			}
-			const other = delimiterChar(line);
-			if (other !== null) {
-				throw new EditError(
-					`delimiter collision at line ${i + 1}: found "${line.trim()}" but this call uses "${delimChar}" — keep one delimiter character for the whole call`,
-				);
-			}
+			// A full-line run of ANOTHER character (or a different length) is
+			// legal content now — no more collision rejections.
 			after.push(line);
 			i++;
 		}
+		if (!terminated) {
+			// EOF closes the after-block; trailing blank lines are patch
+			// artifacts (the final "\n" of the JSON string), not content.
+			while (after.length > 0 && after[after.length - 1].trim() === "") after.pop();
+		}
+
+		if (header.insertAfter) {
+			if (before.length > 0) {
+				throw new EditError(
+					`hunk ${hunks.length + 1}: "+" after the line number is only valid for inserts (empty before-block) — a replace anchors the matched block itself`,
+				);
+			}
+			// A bare delimiter header can never carry "+", so hint is never null here.
+			if (hint < 1) throw new EditError("insert-after needs NNN >= 1");
+		}
 
 		if (before.length === 0 && after.length === 0) {
-		throw new EditError(`hunk ${hunks.length + 1} (${hintLabel(hint)}) is empty: both before and after blocks are blank`);
+			throw new EditError(`hunk ${hunks.length + 1} (${hintLabel(hint)}) is empty: both before and after blocks are blank`);
 		}
-		hunks.push({ hint, before, after });
+		hunks.push({ hint, before, after, ...(header.insertAfter ? { insertAfter: true } : {}) });
 
 		if (terminated && i < lines.length && lines[i].trim() === "" && i === lines.length - 1) {
 			// trailing blank after the final terminator — harmless
@@ -219,6 +254,144 @@ export function parsePatch(patch: string): Hunk[] {
 }
 
 type LineEq = (a: string, b: string) => boolean;
+
+// ---------------------------------------------------------------------------
+// Chain patches: the model wrote "old @@@ new @@@ old @@@ new" with no numbered
+// headers (19 rejections in the 2026-09-30 session). The format is NOT legal
+// input — the model must write line numbers — but instead of a dead-end
+// "expected a hunk header" error, the blocks are located in the file and the
+// response is a ready-to-paste skeleton with real NNN headers.
+// ---------------------------------------------------------------------------
+
+/** Locate a before-block in the file with the same exact→trim→collapse ladder
+ * the resolver uses; uniqueness is mandatory — an ambiguous block is NEVER
+ * auto-picked (same rule as hintless hunks). */
+function locateBlock(fileLines: string[], before: string[]): { status: "ok"; line: number; tier: MatchTier } | { status: "ambiguous"; lines: number[] } | { status: "missing" } {
+	for (const level of LADDER) {
+		const cands: number[] = [];
+		for (let s = 0; s + before.length <= fileLines.length; s++) {
+			if (blockMatches(fileLines, s, before, level.eq)) cands.push(s);
+		}
+		if (cands.length === 1) return { status: "ok", line: cands[0] + 1, tier: level.name as MatchTier };
+		if (cands.length > 1) return { status: "ambiguous", lines: cands.map((c) => c + 1) };
+	}
+	return { status: "missing" };
+}
+
+/** Skeleton for a chain patch; fileLines are needed to number the headers.
+ * Always returns model-facing text — the file is never written from a chain
+ * patch; the model re-emits the skeleton with its own blocks. */
+export function chainSkeleton(patch: string, fileLines: string[]): string {
+	const lines = patch.split("\n");
+	if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+
+	// The chain's delimiter is its first full-line 3+ run.
+	let delimRun: string | null = null;
+	for (const line of lines) {
+		const run = delimiterRun(line);
+		if (run !== null) {
+			delimRun = run;
+			break;
+		}
+	}
+	if (delimRun === null) {
+		return `parse error: no "${DELIM_CHARS[0]}${DELIM_CHARS[0]}${DELIM_CHARS[0]}" delimiter found — a replace patch needs the old block, a "${DELIM_CHARS[0]}${DELIM_CHARS[0]}${DELIM_CHARS[0]}" line, then the new block (see tool description)`;
+	}
+
+	// Split into blocks at own-delim lines and at explicit NNN headers (a mixed
+	// chain keeps its given numbers). Edge blank lines are separators.
+	interface ChainBlock {
+		lines: string[];
+		hint: number | null;
+		insertAfter: boolean;
+	}
+	const blocks: ChainBlock[] = [];
+	let cur: ChainBlock = { lines: [], hint: null, insertAfter: false };
+	const push = () => {
+		while (cur.lines.length > 0 && cur.lines[0].trim() === "") cur.lines.shift();
+		while (cur.lines.length > 0 && cur.lines[cur.lines.length - 1].trim() === "") cur.lines.pop();
+		blocks.push(cur);
+	};
+	for (const line of lines) {
+		const header = parseHunkHeader(line);
+		if (header && header.hint !== null) {
+			push();
+			cur = { lines: [], hint: header.hint, insertAfter: header.insertAfter === true };
+			continue;
+		}
+		if (line.trim() === delimRun) {
+			push();
+			cur = { lines: [], hint: null, insertAfter: false };
+			continue;
+		}
+		cur.lines.push(line);
+	}
+	push();
+	// A trailing empty block is the final terminator, not a hunk.
+	const open = blocks.filter((b) => b.lines.length > 0 || b.hint !== null);
+
+	// Pair blocks into hunks: (before, after), (before, after), …; an odd tail
+	// is a before-block without a replacement.
+	interface Pair {
+		before: ChainBlock;
+		after: ChainBlock | null;
+	}
+	const pairs: Pair[] = [];
+	for (let k = 0; k < open.length; k += 2) {
+		pairs.push({ before: open[k], after: open[k + 1] ?? null });
+	}
+
+	const out: string[] = [
+		`this looks like the chain form ("old ${delimRun} new ${delimRun} old ${delimRun} new") — it needs numbered hunk headers.`,
+		"Here is the same edit with proper headers — paste your blocks between the header and delimiter lines:",
+		"",
+	];
+	for (const pair of pairs) {
+		const before = pair.before;
+		let headerLine: string;
+		if (before.lines.length === 0 && before.hint === null) {
+			headerLine = `<line number here — this hunk inserts new lines, so the header needs NNN (or "NNN+" to insert AFTER line NNN)>`;
+		} else if (before.lines.length === 0) {
+			headerLine = `${before.hint}${before.insertAfter ? "+" : ""} ${delimRun}`;
+		} else {
+			const loc = locateBlock(fileLines, before.lines);
+			if (loc.status === "ok") {
+				const range = `src ${loc.line}-${loc.line + before.lines.length - 1}`;
+				headerLine = `${loc.line} ${delimRun}`;
+				out.push(headerLine);
+				out.push(`<your before block: ${before.lines.length} line${before.lines.length === 1 ? "" : "s"} — it sits at ${range}${loc.tier === "exact" ? "" : " (matched with whitespace differences)"}>`);
+				out.push(delimRun);
+				out.push(pair.after === null
+					? `<your after block — the patch ends here: write the delimiter line again to DELETE this block, or write "NNN ${delimRun}" then "${delimRun}" plus new lines to APPEND after it>`
+					: `<your after block: ${pair.after.lines.length} line${pair.after.lines.length === 1 ? "" : "s"}>`);
+				out.push(delimRun);
+				out.push("");
+				continue;
+			}
+			if (loc.status === "ambiguous") {
+				const capped = loc.lines.slice(0, 5);
+				const more = loc.lines.length > 5 ? ` … and ${loc.lines.length - 5} more` : "";
+				headerLine = `<NOT UNIQUE: this before-block matches at lines ${capped.join(", ")}${more} — extend the before-block with surrounding lines to make it unique, then re-emit with the chosen NNN>`;
+			} else {
+				headerLine = `<NOT FOUND: this before-block does not appear in the file (exact, trimmed and whitespace-collapsed matching all failed) — re-read the file and copy the lines exactly>`;
+			}
+		}
+		out.push(headerLine);
+		out.push(`<your before block: ${before.lines.length} line${before.lines.length === 1 ? "" : "s"}>`);
+		out.push(delimRun);
+		out.push(pair.after === null
+			? `<your after block — the patch ends here: write the delimiter line again to DELETE this block, or write "NNN ${delimRun}" then "${delimRun}" plus new lines to APPEND after it>`
+			: `<your after block: ${pair.after.lines.length} line${pair.after.lines.length === 1 ? "" : "s"}>`);
+		out.push(delimRun);
+		out.push("");
+	}
+	out.push(
+		`Rules: the header is "NNN ${delimRun}" — the line where the old block starts; "+" after the number inserts AFTER that line (inserts only); ` +
+			`inserts have an empty before-block (header line, then the delimiter line, then the new lines); a delete is an empty after-block. ` +
+			`Remove the "<- note" annotations — they are explanations, not patch lines.`,
+	);
+	return out.join("\n");
+}
 
 const exactEq: LineEq = (a, b) => a === b;
 const trimEq: LineEq = (a, b) => a.trim() === b.trim();
@@ -495,14 +668,18 @@ function resolveOne(hunk: Hunk, fileLines: string[], index: number): { ok: Resol
 				},
 			};
 		}
-		const idx = Math.min(Math.max(hint - 1, 0), fileLines.length);
+		// before: insert before line NNN → 0-based index NNN-1, anchor line NNN.
+		// after (NNN+): insert after line NNN → 0-based index NNN, anchor line NNN.
+		const idx = hunk.insertAfter
+			? Math.min(Math.max(hint, 0), fileLines.length)
+			: Math.min(Math.max(hint - 1, 0), fileLines.length);
 		return {
 			ok: {
 				hunk,
 				kind: "insert",
 				start: idx,
 				end: idx,
-				match: { tier: "hint", from: idx + 1, to: idx, hint, distance: 0, farFromHint: false },
+				match: { tier: "hint", from: hunk.insertAfter ? idx : idx + 1, to: idx, hint, distance: 0, farFromHint: false },
 			},
 		};
 	}
@@ -894,7 +1071,11 @@ export function hunkSummary(r: ResolvedHunk, index: number): HunkReport {
 /** Model-facing one-line report per hunk: what happened, where it landed, how
  * confident the match was, and the unambiguous source → result line mapping. */
 export function formatHunkReport(r: ResolvedHunk, index: number, outFrom: number): string {
-	const label = r.kind === "insert" ? "insert" : r.kind === "delete" ? "delete" : "replace";
+	// Direction word on inserts: "insert src line 12" was ambiguous about
+	// BEFORE/AFTER — models landed code outside functions (session 2026-09-30).
+	const label = r.kind === "insert"
+		? r.hunk.insertAfter ? "insert AFTER" : "insert BEFORE"
+		: r.kind === "delete" ? "delete" : "replace";
 	const outTo = outFrom + Math.max(r.hunk.after.length - 1, 0);
 	const srcRange = r.kind === "insert" ? `src line ${r.match.from}` : `src ${r.match.from}-${r.match.to}`;
 	const outRange = r.hunk.after.length === 0 ? "removed" : r.kind === "insert" ? `out line ${outFrom}` : `out ${outFrom}-${outTo}`;
@@ -982,8 +1163,10 @@ export function runPatch(patch: string, fileLines: string[]): EditOutcome {
 	return { reports, lines, totalLines: updated.length, diff: text, diffTruncated: truncated };
 }
 
-/** Reports for the whole batch, with result-side line numbers resolved. */
-export function formatHunkReports(resolved: ResolvedHunk[]): string[] {
+/** Reports for the whole batch, with result-side line numbers resolved.
+ * `numbers` (0-based, optional) restores ORIGINAL hunk numbers when some hunks
+ * were filtered out before resolution (no-op hunks). */
+export function formatHunkReports(resolved: ResolvedHunk[], numbers?: number[]): string[] {
 	const ascending = [...resolved].sort((a, b) => a.start - b.start);
 	const outStart = new Map<ResolvedHunk, number>();
 	let delta = 0;
@@ -991,7 +1174,15 @@ export function formatHunkReports(resolved: ResolvedHunk[]): string[] {
 		outStart.set(r, r.start + 1 + delta);
 		delta += r.hunk.after.length - (r.end - r.start);
 	}
-	return resolved.map((r, i) => formatHunkReport(r, i, outStart.get(r) ?? r.start + 1));
+	return resolved.map((r, i) => formatHunkReport(r, numbers ? numbers[i] : i, outStart.get(r) ?? r.start + 1));
+}
+
+/** A replace hunk whose before-block equals its after-block line for line
+ * (exact): applying it changes nothing, so it is skipped with a note instead
+ * of killing the batch or silently doing busywork. Trim-equal blocks still
+ * apply — whitespace normalization is a real change. */
+export function isNoOpHunk(h: Hunk): boolean {
+	return h.before.length > 0 && h.before.length === h.after.length && h.before.every((l, i) => l === h.after[i]);
 }
 
 // ---------------------------------------------------------------------------

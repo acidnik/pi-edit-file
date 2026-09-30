@@ -9,6 +9,8 @@ import {
 	resolveHunks,
 	applyHunks,
 	runPatch,
+	chainSkeleton,
+	isNoOpHunk,
 	formatHunkReports,
 	sequentialDiffs,
 	EditError,
@@ -60,8 +62,12 @@ test("parse: delimiter escalation to ####", () => {
 	assert.deepEqual(hunks[0].before, ["foo"]);
 });
 
-test("parse: mixed delimiter chars rejected", () => {
-	assert.throws(() => parsePatch("1 @@@\nfoo\n%%%\nbar\n@@@"), EditError);
+test("parse: a foreign-char delimiter run is legal content (exact-run matching)", () => {
+	// Delimiter = the EXACT run from the first header; shorter runs and repeats
+	// of another character are content (spec v2, §10).
+	const hunks = parsePatch("1 @@@\nfoo\n%%%\nbar\n@@@\nfoo2\n%%%\nbar2\n@@@");
+	assert.deepEqual(hunks[0].before, ["foo", "%%%", "bar"]);
+	assert.deepEqual(hunks[0].after, ["foo2", "%%%", "bar2"]);
 });
 
 test("parse: grammar errors", () => {
@@ -189,8 +195,12 @@ test("hunkDiff: header covers context so parsed bStart maps body lines onto the 
 		b++;
 	}
 });
-test("parse: delimiter collision (different char) errors clearly", () => {
-	assert.throws(() => parsePatch("1 @@@\n%%%\n@@@\nx\n@@@"), /collision/);
+test("parse: same-char shorter run is legal content, escalation to a longer run works", () => {
+	// Content containing "@@@" is unwritable with an "@@@" delimiter (it splits
+	// the block); escalating the whole call to "####" makes "@@@" content.
+	const hunks = parsePatch("1 ####\nspecial @@@ line\n####\nspecial @@@ line stays\n####");
+	assert.deepEqual(hunks[0].before, ["special @@@ line"]);
+	assert.deepEqual(hunks[0].after, ["special @@@ line stays"]);
 });
 test("sequentialDiffs: context reflects earlier hunks, headers rebased", () => {
 	const lines = toLines("a\nold1\nmid\nold2\nz");
@@ -669,4 +679,116 @@ test("indent note: JSDoc continuation lines do not count as space indentation", 
 	const doc = toLines("/**\n * old doc\n */\nconst A = 1;\n");
 	const patch = "1 @@@\n/**\n * old doc\n */\n@@@\n/**\n * new doc\n */\n@@@";
 	assert.equal(resolveHunks(parsePatch(patch), doc)[0].match.indentMismatch, undefined);
+});
+// ---------------------------------------------------------------------------
+// Spec v2: chain skeleton, NNN+ insert-after, no-op hunks, artifacts
+// ---------------------------------------------------------------------------
+
+const D = "@@@";
+
+test("chain: even chain yields a numbered skeleton, no auto-apply", () => {
+	const file = toLines("a\nb\nc\nd\ne\nf\ng");
+	const patch = `b\n${D}\nB\n${D}\ne\n${D}\nE\n${D}`;
+	const sk = chainSkeleton(patch, file);
+	assert.match(sk, /chain form/);
+	assert.match(sk, /2 @@@/);        // b sits at line 2
+	assert.match(sk, /5 @@@/);        // e sits at line 5
+	assert.match(sk, /your before block: 1 line . it sits at src 2-2/);
+	assert.match(sk, /Rules:/);
+	assert.equal(file.join("\n"), "a\nb\nc\nd\ne\nf\ng"); // file untouched
+});
+
+test("chain: ambiguous before-block lists ALL candidates, no auto-pick", () => {
+	const file = toLines("same\nsame\nx\nsame\nsame");
+	const sk = chainSkeleton(`same\n${D}\nnew\n${D}`, file);
+	assert.match(sk, /NOT UNIQUE/);
+	assert.match(sk, /matches at lines 1, 2, 4, 5/);
+	assert.doesNotMatch(sk, /2 @@@/); // no number chosen for the model
+});
+
+test("chain: missing block reports NOT FOUND", () => {
+	const sk = chainSkeleton(`nope\n${D}\nnew\n${D}`, toLines("a\nb\nc"));
+	assert.match(sk, /NOT FOUND/);
+});
+
+test("chain: trim-unique block gets a number with a whitespace note", () => {
+	const file = toLines("  spaced line\nx");
+	const sk = chainSkeleton(`spaced line\n${D}\nnew\n${D}`, file);
+	assert.match(sk, /1 @@@/);
+	assert.match(sk, /matched with whitespace differences/);
+});
+
+test("chain: odd tail gets the delete-or-append hint", () => {
+	const file = toLines("a\nb\nc");
+	const sk = chainSkeleton(`b\n${D}\nB\n${D}\nc`, file);
+	assert.match(sk, /the patch ends here/);
+	assert.match(sk, /DELETE this block/);
+});
+
+test("chain: patch without any delimiter gets the no-delimiter error", () => {
+	const sk = chainSkeleton("just some content\nmore content", toLines("a"));
+	assert.match(sk, /no "@@@" delimiter found/);
+});
+
+test("chain: explicit headers inside a chain keep their numbers", () => {
+	const file = toLines("a\nb\nc\nd");
+	const sk = chainSkeleton(`3 @@@\nc\n${D}\nC\n${D}`, file);
+	assert.match(sk, /3 @@@/);
+	assert.match(sk, /src 3-3/);
+});
+
+test("parse: NNN@@@ without a space is a header", () => {
+	const hunks = parsePatch(`2@@@\nb\n${D}\nB\n${D}`);
+	assert.equal(hunks[0].hint, 2);
+	assert.deepEqual(hunks[0].before, ["b"]);
+});
+
+test("insert-after (NNN+): before a middle line vs after it", () => {
+	const file = toLines("a\nb\nc");
+	const beforeHunk = resolveHunks(parsePatch(`2 @@@\n@@@\nNEW\n${D}`), file);
+	const afterHunk = resolveHunks(parsePatch(`2+ @@@\n@@@\nNEW\n${D}`), file);
+	assert.equal(beforeHunk[0].start, 1); // before line 2 → index 1
+	assert.equal(afterHunk[0].start, 2);  // after line 2 → index 2
+	assert.equal(applyHunks(file, afterHunk).join("\n"), "a\nb\nNEW\nc");
+});
+
+test("insert-after (NNN+): after the last line appends", () => {
+	const file = toLines("a\nb");
+	const resolved = resolveHunks(parsePatch(`2+ @@@\n@@@\nNEW\n${D}`), file);
+	assert.equal(applyHunks(file, resolved).join("\n"), "a\nb\nNEW");
+});
+
+test("insert-after (NNN+): rejected on replace and zero headers", () => {
+	assert.throws(() => parsePatch(`1+ @@@\na\n${D}\nA\n${D}`), /only valid for inserts/);
+	assert.throws(() => parsePatch(`0+ @@@\n@@@\nNEW\n${D}`), /needs NNN >= 1/);
+});
+
+test("parse: trailing blank lines of an EOF-closed after-block are dropped", () => {
+	const hunks = parsePatch(`1 @@@\na\n${D}\nA\n\n\n`);
+	assert.deepEqual(hunks[0].after, ["A"]);
+	// ...but blanks before an explicit terminator are content
+	const explicit = parsePatch(`1 @@@\na\n${D}\nA\n\n${D}`);
+	assert.deepEqual(explicit[0].after, ["A", ""]);
+});
+
+test("no-op: exact before==after is reported as skipped", () => {
+	assert.equal(isNoOpHunk({ hint: 1, before: ["a", "b"], after: ["a", "b"] }), true);
+	assert.equal(isNoOpHunk({ hint: 1, before: ["a"], after: ["a "] }), false); // trim-diff applies
+	assert.equal(isNoOpHunk({ hint: 1, before: [], after: ["new"] }), false);    // insert
+});
+
+test("report: insert direction is spelled out (BEFORE/AFTER)", () => {
+	const file = toLines("a\nb\nc");
+	const beforeRep = formatHunkReports(resolveHunks(parsePatch(`2 @@@\n@@@\nNEW\n${D}`), file));
+	const afterRep = formatHunkReports(resolveHunks(parsePatch(`2+ @@@\n@@@\nNEW\n${D}`), file));
+	assert.match(beforeRep[0], /insert BEFORE src line 2/);
+	assert.match(afterRep[0], /insert AFTER src line 2/);
+});
+
+test("report: original hunk numbers survive no-op filtering", () => {
+	const out = formatHunkReports(
+		resolveHunks([parsePatch(`1 @@@\na\n${D}\nA\n${D}`)[0]], toLines("a\nb")),
+		[1], // 0-based original index: this active hunk was hunk 2 in the patch
+	);
+	assert.match(out[0], /hunk 2:/);
 });
