@@ -44,7 +44,7 @@ Or try it for one run:
 pi -e git:github.com/acidnik/pi-edit-file
 ```
 
-Loaded from a package, `edit_file` coexists with whatever editing tools you already have. If you previously kept it as a plain extension file (`~/.pi/agent/extensions/edit-file.ts`), remove that file first — otherwise the tool gets registered twice.
+Loaded from a package, `edit_file` withdraws pi's built-in `edit` tool (same name re-registered with `exposure: "hidden"`), so the model sees a single edit path instead of picking between `edit` and `edit_file` mid-session. Plugin-provided `quick_edit` / `target_edit` are left active as a fallback. If you previously kept it as a plain extension file (`~/.pi/agent/extensions/edit-file.ts`), remove that file first — otherwise the tool gets registered twice.
 
 ## Patch format
 

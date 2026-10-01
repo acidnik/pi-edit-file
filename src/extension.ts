@@ -8,9 +8,10 @@
  * See src/core.ts for the parser/resolver/applier and
  * block-edit-plan.md for rationale. Name decided: edit_file.
  *
- * Also overrides the built-in `write` tool: overwriting an existing file renders
- * the same diff (per-line syntax highlighting, word-level emphasis, line
- * backgrounds) instead of the content preview.
+ * Also withdraws pi's built-in `edit` tool (exact text replacement), so edit_file
+ * is the only edit path, and overrides the built-in `write` tool: overwriting an
+ * existing file renders the same diff (per-line syntax highlighting, word-level
+ * emphasis, line backgrounds) instead of the content preview.
  */
 
 import { Type } from "typebox";
@@ -41,6 +42,9 @@ import {
 } from "./core.ts";
 
 const TOOL_NAME = "edit_file";
+
+/** pi's built-in exact-text edit tool; withdrawn by editFileExtension(). */
+const BUILTIN_EDIT_TOOL = "edit";
 
 const DESCRIPTION = `Edit a file using one or more block patches passed as a single 'patch' string. Each hunk:
 
@@ -248,11 +252,21 @@ export default function editFileExtension(pi: { registerTool: (t: unknown) => vo
 		},
 	});
  
-	// quick_edit / target_edit are NOT built-in pi tools — they are plugin-provided
-	// and are intentionally kept active as a fallback (Nik's decision, 2026-09-26),
-	// so edit_file no longer deactivates anything. It just has to be the tool the
-	// model reaches for first; the per-hunk summary and precise match diagnostics
-	// keep the two edit paths from being confused.
+	// pi's built-in `edit` tool must not compete with edit_file, so it is
+	// withdrawn: re-registering a name with exposure "hidden" is pi's way to
+	// unregister it (the tool registry has no unregister). Without this the model
+	// mixes `edit` and `edit_file` within a single session.
+	//
+	// registerTool() only validates that parameters is an object schema, so the
+	// hidden stub needs no name/description/execute of its own.
+	pi.registerTool({
+		name: BUILTIN_EDIT_TOOL,
+		exposure: "hidden",
+		parameters: Type.Object({}),
+	});
+
+	// Plugin-provided quick_edit / target_edit are deliberately left alone
+	// (Nik's decision, 2026-09-26): they stay as a fallback edit path.
 	registerWriteDiff(pi);
 }
 
