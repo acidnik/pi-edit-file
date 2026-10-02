@@ -100,6 +100,16 @@ function delimiterRun(line: string): string | null {
 	return m[0].trim();
 }
 
+/** The call's delimiter run: the first full-line 3+ run in the patch. Every
+ * header and every closing delimiter of the call repeats this exact run. */
+export function patchDelimiter(patch: string): string | null {
+	for (const line of patch.split("\n")) {
+		const run = delimiterRun(line);
+		if (run !== null) return run;
+	}
+	return null;
+}
+
 /** A hunk header: "NNN @@@" (optional "+" = insert-after, optional space),
  * or a bare "@@@" line (hint omitted — the block must then match exactly
  * once in the file). */
@@ -182,6 +192,7 @@ export function parsePatch(patch: string): Hunk[] {
 			if (HEADER_RE.test(lines[i])) {
 				throw new EditError(
 					`parse error at line ${i + 1}: hunk header found before the closing delimiter — missing "${delimRun}" separator?`,
+					"missing-separator",
 				);
 			}
 			before.push(lines[i]);
@@ -190,6 +201,7 @@ export function parsePatch(patch: string): Hunk[] {
 		if (i >= lines.length) {
 			throw new EditError(
 				`parse error: unterminated hunk (${hintLabel(hint)}) — missing closing "${delimRun}" between the old and new blocks`,
+				"unterminated",
 			);
 		}
 		i++; // consume the closing delimiter
@@ -285,15 +297,7 @@ export function chainSkeleton(patch: string, fileLines: string[]): string {
 	const lines = patch.split("\n");
 	if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
 
-	// The chain's delimiter is its first full-line 3+ run.
-	let delimRun: string | null = null;
-	for (const line of lines) {
-		const run = delimiterRun(line);
-		if (run !== null) {
-			delimRun = run;
-			break;
-		}
-	}
+	const delimRun = patchDelimiter(patch);
 	if (delimRun === null) {
 		return `parse error: no "${DELIM_CHARS[0]}${DELIM_CHARS[0]}${DELIM_CHARS[0]}" delimiter found — a replace patch needs the old block, a "${DELIM_CHARS[0]}${DELIM_CHARS[0]}${DELIM_CHARS[0]}" line, then the new block (see tool description)`;
 	}
@@ -342,8 +346,9 @@ export function chainSkeleton(patch: string, fileLines: string[]): string {
 	}
 
 	const out: string[] = [
-		`this looks like the chain form ("old ${delimRun} new ${delimRun} old ${delimRun} new") — it needs numbered hunk headers.`,
-		"Here is the same edit with proper headers — paste your blocks between the header and delimiter lines:",
+		`these blocks have no hunk header — that is the chain form ("old ${delimRun} new ${delimRun} old ${delimRun} new"), and it is not legal input: with two or more blocks every block needs its own header.`,
+		`A single block needs no number at all: start the patch with a bare "${delimRun}" line — allowed when the block appears exactly once in the file.`,
+		"Here is the same edit with the headers filled in — paste your blocks between the header and delimiter lines:",
 		"",
 	];
 	for (const pair of pairs) {
@@ -1175,6 +1180,50 @@ export function formatHunkReports(resolved: ResolvedHunk[], numbers?: number[]):
 		delta += r.hunk.after.length - (r.end - r.start);
 	}
 	return resolved.map((r, i) => formatHunkReport(r, numbers ? numbers[i] : i, outStart.get(r) ?? r.start + 1));
+}
+
+/** Advisory lines printed ABOVE the per-hunk reports. A hunk whose anchor is off
+ * was matched by CONTENT, so the edit landed where the block is — but the
+ * model's numbering was stale (2026-10-01 feedback: a second hunk numbered by
+ * the first hunk's result lines). Distance 0 and exact-hint matches are silent. */
+export function reportCaveats(resolved: ResolvedHunk[], numbers?: number[]): string[] {
+	const out: string[] = [];
+	resolved.forEach((r, i) => {
+		if (r.match.tier === "hint" || r.match.hint === null || r.match.distance === 0) return;
+		const at = r.kind === "insert" ? `src line ${r.match.from}` : `src ${r.match.from}-${r.match.to}`;
+		const window = r.match.farFromHint ? " — outside the ±20-line window, verify it is the right block" : "";
+		out.push(`note: hunk ${(numbers ? numbers[i] : i) + 1}'s anchor ${r.match.hint} was off by ${r.match.distance}: the block matched by content at ${at}${window}.`);
+	});
+	if (resolved.length > 1) {
+		out.push(
+			"note: every hunk of one call matches the ORIGINAL file numbering — the out-numbers are for a follow-up call, not for the other hunks of this one.",
+		);
+	}
+	return out;
+}
+
+/** The most common stylistic miss (2026-10-01 feedback): an insert written as a
+ * replace that repeats the old block and only adds lines. Returns one advisory
+ * line for the first such hunk — the insert forms need no old block at all. */
+export function insertTip(resolved: ResolvedHunk[], numbers?: number[], delim = "@@@"): string | null {
+	for (let i = 0; i < resolved.length; i++) {
+		const r = resolved[i];
+		if (r.kind !== "replace" || r.hunk.before.length === 0) continue;
+		const before = r.hunk.before;
+		const after = r.hunk.after;
+		if (after.length <= before.length) continue;
+		const added = after.length - before.length;
+		const lines = `${added} line${added === 1 ? "" : "s"}`;
+		const body = `"${delim}", the new ${lines}, "${delim}"`;
+		const n = (numbers ? numbers[i] : i) + 1;
+		if (after.slice(0, before.length).every((l, k) => l === before[k])) {
+			return `hunk ${n}: this replace only adds ${lines} AFTER src line ${r.match.to} — "${r.match.to}+ ${delim}", ${body} does that without repeating the old block.`;
+		}
+		if (after.slice(after.length - before.length).every((l, k) => l === before[k])) {
+			return `hunk ${n}: this replace only adds ${lines} BEFORE src line ${r.match.from} — "${r.match.from} ${delim}", ${body} does that without repeating the old block.`;
+		}
+	}
+	return null;
 }
 
 /** A replace hunk whose before-block equals its after-block line for line

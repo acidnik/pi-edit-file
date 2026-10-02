@@ -18,6 +18,9 @@ import {
 	unifiedDiff,
 	parseUnifiedDiff,
 	wordDiffPair,
+	patchDelimiter,
+	reportCaveats,
+	insertTip,
 } from "../src/core.ts";
 
 const FILE = [
@@ -791,4 +794,101 @@ test("report: original hunk numbers survive no-op filtering", () => {
 		[1], // 0-based original index: this active hunk was hunk 2 in the patch
 	);
 	assert.match(out[0], /hunk 2:/);
+});
+
+// ---------------------------------------------------------------------------
+// Feedback 2026-10-01: grammar discoverability, stale anchors, insert tip
+// ---------------------------------------------------------------------------
+
+test("parse: delimiter-missing errors carry codes for the skeleton path", () => {
+	const missing = `1 @@@\na\n3 @@@\nb\n${D}`;
+	assert.throws(() => parsePatch(missing), (e: unknown) => (e as EditError).code === "missing-separator");
+	const unterminated = `1 @@@\na\nb`;
+	assert.throws(() => parsePatch(unterminated), (e: unknown) => (e as EditError).code === "unterminated");
+	// `missing` still has one full-line run, so the skeleton can split the blocks
+	// and is built; `unterminated` has only a header-style delimiter, and there
+	// the extension keeps the precise diagnosis (grammarError guard in
+	// src/extension.ts) instead of the skeleton's "no delimiter found" fallback.
+	assert.equal(patchDelimiter(missing), "@@@");
+	assert.equal(patchDelimiter(unterminated), null);
+	assert.equal(patchDelimiter(`1 @@@\na\n@@@\nb\n@@@`), "@@@");
+});
+
+test("delimiter: patchDelimiter returns the call's run", () => {
+	assert.equal(patchDelimiter(`2 @@@\na\n@@@\nA\n@@@`), "@@@");
+	assert.equal(patchDelimiter(`2 ####\na\n####\nA\n####`), "####");
+	assert.equal(patchDelimiter("no delimiters here"), null);
+});
+
+test("chain: preamble teaches that a single block needs no number", () => {
+	const sk = chainSkeleton(`b\n${D}\nB\n${D}`, toLines("a\nb\nc"));
+	assert.match(sk, /chain form/);
+	assert.match(sk, /A single block needs no number at all/);
+	assert.match(sk, new RegExp(`bare "${D}" line`));
+});
+
+test("caveats: exact-hint and distance-0 matches are silent", () => {
+	const file = toLines("a\nb\nc");
+	assert.deepEqual(reportCaveats(resolveHunks(parsePatch(`2 @@@\nb\n${D}\nB\n${D}`), file)), []);
+	assert.deepEqual(reportCaveats(resolveHunks(parsePatch(`2 @@@\n@@@\nNEW\n${D}`), file)), []);
+});
+
+test("caveats: an off-by anchor names the hint and the matched src range", () => {
+	const file = toLines("a\nb\nc\nd\ne");
+	const caveats = reportCaveats(resolveHunks(parsePatch(`5 @@@\nb\nc\n${D}\nB\nC\n${D}`), file));
+	assert.equal(caveats.length, 1);
+	assert.match(caveats[0], /hunk 1's anchor 5 was off by 2: the block matched by content at src 2-3\./);
+	assert.doesNotMatch(caveats[0], /outside the ±20-line window/);
+});
+
+test("caveats: an anchor beyond ±20 adds the window warning", () => {
+	const file = Array.from({ length: 40 }, (_, i) => `line ${i + 1}`);
+	const caveats = reportCaveats(resolveHunks(parsePatch(`1 @@@\nline 35\n${D}\nX\n${D}`), file));
+	assert.equal(caveats.length, 1);
+	assert.match(caveats[0], /off by 34: the block matched by content at src 35-35/);
+	assert.match(caveats[0], /outside the ±20-line window, verify it is the right block/);
+});
+
+test("caveats: a multi-hunk call gets the original-numbering note", () => {
+	const file = toLines("a\nb\nc\nd\ne");
+	const resolved = resolveHunks(parsePatch(`1 @@@\na\n${D}\nA\n${D}\n4 @@@\nd\n${D}\nD\n${D}`), file);
+	assert.equal(resolved.length, 2);
+	const caveats = reportCaveats(resolved);
+	assert.equal(caveats.length, 1);
+	assert.match(caveats[0], /every hunk of one call matches the ORIGINAL file numbering/);
+});
+
+test("caveats: restored hunk numbers are used in the note", () => {
+	const file = toLines("a\nb\nc\nd\ne");
+	const caveats = reportCaveats(resolveHunks(parsePatch(`5 @@@\nb\nc\n${D}\nB\nC\n${D}`), file), [1]);
+	assert.match(caveats[0], /hunk 2's anchor/);
+});
+
+test("tip: an append written as a replace points at NNN+", () => {
+	const file = toLines("function f() {\n\treturn 1;\n}");
+	const resolved = resolveHunks(parsePatch(`1 @@@\nfunction f() {\n${D}\nfunction f() {\n\tconst x = 1;\n${D}`), file);
+	const tip = insertTip(resolved);
+	assert.match(tip ?? "", /only adds 1 line AFTER src line 1/);
+	assert.match(tip ?? "", /"1\+ @@@"/);
+	assert.match(tip ?? "", /without repeating the old block/);
+});
+
+test("tip: a prepend written as a replace points at insert-before", () => {
+	const file = toLines("a\ntarget\nc");
+	const resolved = resolveHunks(parsePatch(`2 @@@\ntarget\n${D}\nnew line\ntarget\n${D}`), file);
+	const tip = insertTip(resolved);
+	assert.match(tip ?? "", /only adds 1 line BEFORE src line 2/);
+	assert.match(tip ?? "", /"2 @@@"/);
+});
+
+test("tip: a real rewrite and a plain insert get no tip", () => {
+	const file = toLines("a\nb\nc");
+	assert.equal(insertTip(resolveHunks(parsePatch(`2 @@@\nb\n${D}\nB2\n${D}`), file)), null);
+	assert.equal(insertTip(resolveHunks(parsePatch(`2 @@@\n@@@\nNEW\n${D}`), file)), null);
+});
+
+test("tip: the call's own delimiter is used in the advice", () => {
+	const file = toLines("a\nb\nc");
+	const resolved = resolveHunks(parsePatch(`2 ####\nb\n####\nb\nnew line\n####`), file);
+	assert.match(insertTip(resolved, undefined, "####") ?? "", /"2\+ ####"/);
 });

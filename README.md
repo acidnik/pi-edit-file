@@ -50,8 +50,9 @@ Loaded from a package, `edit_file` withdraws pi's built-in `edit` tool (same nam
 
 - `NNN` — 1-based line number where the old block starts. It is an **anchor hint, not a requirement**: the nearest match wins. It may be omitted entirely — start the hunk with a bare `@@@` and the block must then match exactly once in the file (an insert still needs `NNN`, since there is no block to match).
 - `@@@` — delimiter: 3+ repetitions of one character from `@ # % $ ~ ^ = +`. The character is fixed by the first delimiter and must stay the same for the whole call; escalate to a longer run (`####`) when the file content contains a line like `@@@`.
-- Empty old block → **insert** before line `NNN` (append when `NNN` is past the end). Empty new block → **delete**. Otherwise → **replace**.
+- Empty old block → **insert**: `NNN @@@` inserts **before** line `NNN`, `NNN+ @@@` inserts **after** it (append when `NNN` is past the end). Empty new block → **delete**. Otherwise → **replace**. A hunk whose old block equals its new block is skipped with a note.
 - The patch is a JSON string: one patch line is one file line. You never type `\n` yourself — write real line breaks. Backticks, `${...}` and quotes need no escaping.
+- A line that *looks* like a hunk header (`NNN` followed by the delimiter — e.g. a line of documentation about this format) starts the next hunk, so it cannot be block content: keep such lines out of a patch, or write them with a leading space and clean up in a second call.
 
 Several hunks per call, applied atomically:
 
@@ -61,7 +62,7 @@ const timeout = 1000
 @@@
 const timeout = 5000
 @@@
-120 @@@
+120+ @@@
 @@@
 export const maxRetries = 3
 @@@
@@ -84,11 +85,14 @@ Indentation of the file is preserved for matched lines; `CRLF`/`LF` and the pres
 A successful call reports every hunk with its tier, its real location, and the resulting line numbers (`src` = original file, `out` = resulting file):
 
 ```
+note: hunk 1's anchor 20 was off by 49: the block matched by content at src 69-72 — outside the ±20-line window, verify it is the right block.
 hunk 1: replace src 69-72 → out 69-73 (4 → 5 lines), exact match, hint 20 off by 49 [LOW CONFIDENCE: matched outside the ±20 line window]
 hunk 2: insert src line 100 → out line 101 (0 → 3 lines), trim match, unique match (no hint given)
 src = original file, out = resulting file
 file: src/widget.ts — now 205 lines (was 193)
 ```
+
+A `note:` line sits above the hunk reports whenever something about the match needs reading before the numbers: a stale anchor (hint and matched `src` lines are both named) and, in a multi-hunk call, the reminder that every hunk was matched against the original numbering — the `out`-numbers are for a follow-up call, never for a later hunk of the same one. The last line may also name a shorter form (`NNN+ @@@`) when an insert was written as a replace.
 
 `[LOW CONFIDENCE: …]` marks a match found outside the hint window; `[also matches at lines 12, 45 — verify the right one]` marks ambiguous snippets that were resolved by proximity; `[indentation: file indents with tabs, the patch's new lines use spaces]` marks a silent indent-style change (reported, never rewritten).
 
@@ -120,8 +124,9 @@ Not-found is the most expensive failure because it is the one models retry blind
 | Unified-diff habit (`-old` / `+new`) | `this looks like a unified diff … the patch format needs a "@@@" delimiter between the old and new blocks` |
 | Typo in one character (`1000` → `1001`) | `closest line 2 (95% similar): "const timeout = 1000;"` |
 | Hand-written `\n` inside a line | `Escaping note: a literal "\n" in a before-line is a backslash followed by "n", not a line break …` |
+| No hunk header at all (chain form), a header where the closing delimiter belongs, or an unterminated hunk | the blocks are located in the file and re-emitted as a ready-to-paste numbered skeleton (`NOT UNIQUE` / `NOT FOUND` placeholders when a block cannot be pinned), with the note that a single unique block may start with a bare delimiter line instead of a number |
 
-Not-found failures also include the nearest candidate region with per-line `=` / `≠` markers, and a **ready-to-paste corrected hunk** built from the real file content:
+Grammar failures get the same treatment as not-found ones: the patch is never applied, and the reply rebuilds the model's own blocks into legal form instead of stopping at a parse error. Not-found failures also include the nearest candidate region with per-line `=` / `≠` markers, and a **ready-to-paste corrected hunk** built from the real file content:
 
 ```
 Closest candidate: lines 2-4 — 2 of 3 line(s) match.
@@ -144,7 +149,7 @@ function f() {
 
 ## Rendering
 
-The UI draws the change as a unified diff with word-level highlighting (`details.diff`); the model-facing content stays a summary, because models that see raw diffs in tool output start imitating the diff format in their own patches (this happened, and is why the escaping and diff-style diagnostics above exist).
+The UI draws the change as a unified diff with word-level highlighting (`details.diff`). The transcript card shows that diff plus a compact `+adds / -removals · N hunks` line — the per-hunk report, the anchor caveats and the shorter-form tip are written for the model and are **not** drawn next to the diff (Nik, 2026-10-01: "только сам дифф"). The model-facing content stays a summary, because models that see raw diffs in tool output start imitating the diff format in their own patches (this happened, and is why the escaping and diff-style diagnostics above exist).
 
 The same renderer is attached to a `write` override, so overwriting an existing file shows a diff of the old content instead of a bare "Successfully wrote to …".
 
@@ -154,7 +159,7 @@ The same renderer is attached to a `write` override, so overwriting an existing 
 npm test
 ```
 
-71 tests over the pure core (parser, matching ladder, atomicity, diagnostics, diff generation, CRLF handling). The core has no Pi imports, so it runs on plain Node ≥ 22.6 with the built-in type stripping.
+99 tests over the pure core (parser, matching ladder, atomicity, diagnostics, report caveats, diff generation, CRLF handling). The core has no Pi imports, so it runs on plain Node ≥ 22.6 with the built-in type stripping.
 
 ## License
 

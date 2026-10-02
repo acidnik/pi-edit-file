@@ -39,6 +39,9 @@ import {
 	sequentialDiffs,
 	truncateDiff,
 	parseUnifiedDiff,
+	patchDelimiter,
+	reportCaveats,
+	insertTip,
 } from "./core.ts";
 
 const TOOL_NAME = "edit_file";
@@ -46,38 +49,49 @@ const TOOL_NAME = "edit_file";
 /** pi's built-in exact-text edit tool; withdrawn by editFileExtension(). */
 const BUILTIN_EDIT_TOOL = "edit";
 
-const DESCRIPTION = `Edit a file using one or more block patches passed as a single 'patch' string. Each hunk:
+const DESCRIPTION = `Edit a file with one or more block patches in a single 'patch' string.
 
-NNN @@@
-old line 1
-old line 2
+Three shapes — pick the shortest one that expresses the edit:
+
+1) replace, anchored (NNN is a 1-based line hint, not strict):
+42 @@@
+const timeout = 1000
 @@@
-new line 1
-new line 2
+const timeout = 5000
 @@@
 
-- NNN: 1-based line number where the old block starts (anchor hint, not strict). It may be omitted entirely — write a bare "@@@" line as the header and the block must then match exactly once in the file (an insert still needs NNN, since it has no block to match).
-- Insert direction: an insert with "NNN @@@" goes BEFORE line NNN. To insert AFTER line NNN, write "NNN+ @@@" (the "+" goes right after the number). "NNN+ @@@" is only valid for inserts — a replace anchors the matched block itself.
+2) replace by content only — omit the number and the block must occur exactly once in the file:
+@@@
+const timeout = 1000
+@@@
+const timeout = 5000
+@@@
+
+3) insert lines with an empty old block: "NNN @@@" inserts BEFORE line NNN, "NNN+ @@@" inserts AFTER it:
+120+ @@@
+@@@
+export const maxRetries = 3
+@@@
+
+- Replace: NNN is where the old block starts in the file — a hint, not a strict address; the block itself is found by content (see Matching below). It may be omitted entirely, and then the block must occur exactly once.
 - The patch is a JSON string: one patch line is one file line. Never type "\\n" yourself — write real line breaks. Backticks, \${...} and quotes need no escaping.
 - @@@: delimiter, 3+ repetitions of one char from @ # % $ ~ ^ = +. The EXACT run from the first header is the call's delimiter on every line; a content line that equals it splits the block — escalate to a longer run (####) for the whole call (then "@@@" stays content).
-- Empty old block → insert new lines before line NNN (append at end of file if NNN is past the last line).
-- Empty new block → delete the old block.
-- Otherwise → replace the matched old block with the new block.
+- Empty old block → insert, empty new block → delete, otherwise → replace. "NNN+ @@@" is inserts only; a replace anchors its matched block itself. A hunk whose old block equals its new block is skipped with a note.
 
-Matching (per hunk, against the ORIGINAL file content): exact block match, then trimmed lines, then whitespace-collapsed lines. Searched first within ±20 lines of NNN, then the whole file. The match nearest to NNN wins, where the distance is measured to the matched RANGE (a hint inside the block means distance 0). Two matches at the same distance → the patch is rejected as ambiguous; distinct candidates are listed in the report. All hunks must match; overlapping hunks are rejected; the whole edit is atomic — on any failure the batch is rejected as a whole and the report states the fate of every hunk (nothing is written).
+Matching (per hunk, against the ORIGINAL file content): exact block match, then trimmed lines, then whitespace-collapsed lines. Searched first within ±20 lines of NNN, then the whole file. The match nearest to NNN wins, where the distance is measured to the matched RANGE (a hint inside the block means distance 0). Two matches at the same distance → the patch is rejected as ambiguous; distinct candidates are listed in the report. Every hunk of one call is matched against that same original text: the out-numbers of an earlier hunk of the same call are NOT valid hints for a later one, they are for a follow-up call. All hunks must match; overlapping hunks are rejected; the whole edit is atomic — on any failure the batch is rejected as a whole and the report states the fate of every hunk (nothing is written).
 
-The report also tells you how each hunk matched, e.g. "replace src 69-72 → out 69-73 (4 → 5 lines), exact match, hint 20 off by 49 [LOW CONFIDENCE: matched outside the ±20 line window]": src = line numbers in the original file, out = in the resulting file. "also matches at lines …" warns about identical snippets elsewhere, "indentation: …" warns that the inserted lines use a different indent style than the file.
+The report tells you how each hunk matched, e.g. "replace src 69-72 → out 69-73 (4 → 5 lines), exact match, hint 20 off by 49 [LOW CONFIDENCE: matched outside the ±20 line window]": src = line numbers in the original file, out = in the resulting file. A hunk whose anchor was off gets a "note:" line above the per-hunk reports, naming both the hint and the src lines it matched; "also matches at lines …" warns about identical snippets elsewhere; "indentation: …" warns that the inserted lines use a different indent style than the file. The last line may also point out a shorter form ("NNN+ @@@") when an insert was written as a replace.
 
 A hunk whose old block exactly equals its new block (no-op) is skipped with a note; the rest of the batch applies.
 
-Concatenate multiple hunks in one patch. Example — change line 42 and append after line 120:
+Concatenate multiple hunks in one patch. Example — change line 42, then insert after line 120:
 
 42 @@@
 const timeout = 1000
 @@@
 const timeout = 5000
 @@@
-120 @@@
+120+ @@@
 @@@
 export const maxRetries = 3
 @@@
@@ -140,12 +154,21 @@ export default function editFileExtension(pi: { registerTool: (t: unknown) => vo
 				parsed = parsePatch(params.patch);
 			} catch (err) {
 				if (err instanceof EditError) {
-					if (err.code === "content-start") {
-						// The model wrote the chain form ("old @@@ new @@@ …"). Never
-						// applied as-is; translate it into a numbered skeleton and
-						// teach the format on the model's own example.
+					// Grammar failures get a ready-to-paste skeleton built from the
+					// model's own blocks: a patch that opens with content (the chain
+					// form) and the two "delimiter missing" cases. The unified-diff
+					// and delimiter-mismatch messages already carry their own
+					// corrected snippet, so they are left alone.
+					//
+					// A skeleton needs at least one full-line delimiter to split the
+					// blocks on. Without one (only "NNN @@@" headers, no standalone
+					// delimiter line) its fallback text is the generic "no delimiter
+					// found" — then the precise diagnosis alone is more useful.
+					const grammarError = err.code === "content-start" || err.code === "missing-separator" || err.code === "unterminated";
+					if (grammarError && (err.code === "content-start" || patchDelimiter(params.patch) !== null)) {
 						const skeleton = chainSkeleton(params.patch, readLines(absPath).lines);
-						throw new EditError(`patch rejected — nothing was written to the file.\n${skeleton}`);
+						const diagnosis = err.code === "content-start" ? "" : `${err.message}\n\n`;
+						throw new EditError(`patch rejected — nothing was written to the file.\n${diagnosis}${skeleton}`);
 					}
 					throw new EditError(`patch rejected — nothing was written to the file.\n${err.message}`);
 				}
@@ -177,9 +200,14 @@ export default function editFileExtension(pi: { registerTool: (t: unknown) => vo
 				writeFileSync(absPath, serializeLines(updated, file.crlf, file.finalNewline), "utf8");
 
 				const reports = resolved.map((r, i) => hunkSummary(r, i));
+				// Caveats and the shorter-form tip go ABOVE the per-hunk lines: stale
+				// anchors, batch numbering and an insert written as a replace are the
+				// parts a model must not skim past.
+				const tip = insertTip(resolved, hunkNumbers, patchDelimiter(params.patch) ?? "@@@");
+				const caveats = [...reportCaveats(resolved, hunkNumbers), ...(tip ? [tip] : [])];
 				// src = line numbers in the original file, out = in the result file;
 				// hunk numbers stay the patch's original numbering across no-op skips
-				const reportLines = formatHunkReports(resolved, hunkNumbers);
+				const reportLines = [...caveats, ...formatHunkReports(resolved, hunkNumbers)];
 				const summary =
 					`${[...reportLines, ...noOpNotes].join("\n")}\nsrc = original file, out = resulting file\n` +
 					`follow-up edits: use the out-numbers from this report as hints — they match the file as it is now`;
@@ -239,13 +267,12 @@ export default function editFileExtension(pi: { registerTool: (t: unknown) => vo
 			if (details?.diffTruncated) text += theme.fg("warning", " [truncated]");
 
 			// Diff развёрнут по умолчанию (решение Ника); expanded от UI игнорируем.
+			// The per-hunk report lines (caveats, src/out mapping, shorter-form tip)
+			// are deliberately NOT drawn: they are written for the model, and in the
+			// transcript they are noise next to the diff (Nik, 2026-10-01 — "только
+			// сам дифф"). details.reportLines keeps them for exports and debugging.
 			if (diffLines.length > 0) {
 				text += `\n${renderDiffBody(diff, details?.path, theme)}`;
-				// Same wording as the model-facing report (src = original file,
-				// out = resulting file), so the transcript and the tool agree.
-				for (const line of details?.reportLines ?? []) {
-					text += `\n${theme.fg("dim", line)}`;
-				}
 			}
 
 			return new Text(text, 0, 0);
