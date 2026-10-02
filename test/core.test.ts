@@ -21,6 +21,7 @@ import {
 	patchDelimiter,
 	reportCaveats,
 	insertTip,
+	headerlessSingleHunk,
 } from "../src/core.ts";
 
 const FILE = [
@@ -823,7 +824,7 @@ test("delimiter: patchDelimiter returns the call's run", () => {
 test("chain: preamble teaches that a single block needs no number", () => {
 	const sk = chainSkeleton(`b\n${D}\nB\n${D}`, toLines("a\nb\nc"));
 	assert.match(sk, /chain form/);
-	assert.match(sk, /A single block needs no number at all/);
+	assert.match(sk, /A block that occurs exactly once in the file needs no number/);
 	assert.match(sk, new RegExp(`bare "${D}" line`));
 });
 
@@ -891,4 +892,57 @@ test("tip: the call's own delimiter is used in the advice", () => {
 	const file = toLines("a\nb\nc");
 	const resolved = resolveHunks(parsePatch(`2 ####\nb\n####\nb\nnew line\n####`), file);
 	assert.match(insertTip(resolved, undefined, "####") ?? "", /"2\+ ####"/);
+});
+
+// ---------------------------------------------------------------------------
+// Headerless single hunk: content, one delimiter, content (2026-10-02 feedback)
+// ---------------------------------------------------------------------------
+
+test("headerless: content + one delimiter is a single replace hunk", () => {
+	const patch = `    indented A\n    indented B\n${D}\n    indented A\n    indented B (edited)`;
+	const hunks = parsePatch(patch);
+	assert.equal(hunks.length, 1);
+	assert.equal(hunks[0].hint, null);
+	assert.deepEqual(hunks[0].before, ["    indented A", "    indented B"]);
+	assert.deepEqual(hunks[0].after, ["    indented A", "    indented B (edited)"]);
+	assert.equal(hunks[0].leadingDelimiterOmitted, true);
+});
+
+test("headerless: the edit applies, reported as a unique hintless match", () => {
+	const file = toLines("    indented A\n    indented B\n    indented C\n    tail");
+	const patch = `    indented A\n    indented B\n${D}\n    indented A\n    indented B (edited)`;
+	const resolved = resolveHunks(parsePatch(patch), file);
+	assert.equal(applyHunks(file, resolved).join("\n"), "    indented A\n    indented B (edited)\n    indented C\n    tail");
+	assert.match(formatHunkReports(resolved)[0], /replace src 1-2 → out 1-2 \(2 → 2 lines\), exact match, unique match \(no hint given\)/);
+});
+
+test("headerless: empty new block deletes, and the nudge is reported", () => {
+	const file = toLines("a\nb\nc");
+	const resolved = resolveHunks(parsePatch(`a\nb\n${D}\n`), file);
+	assert.equal(applyHunks(file, resolved).join("\n"), "c");
+	assert.match(reportCaveats(resolved).join("\n"), /the patch had no leading hunk header/);
+});
+
+test("headerless: the canonical bare form gets no nudge", () => {
+	const file = toLines("a\nb\nc");
+	assert.deepEqual(reportCaveats(resolveHunks(parsePatch(`${D}\na\nb\n${D}\nc\n${D}`), file)), []);
+});
+
+test("headerless: an ambiguous block is still rejected, never auto-picked", () => {
+	const file = toLines("same\nsame\nx\nsame\nsame");
+	assert.throws(() => resolveHunks(parsePatch(`same\n${D}\nnew`), file), /no NNN hint given and the block matches at lines/);
+});
+
+test("headerless: the helper stays out when the reading is not unambiguous", () => {
+	assert.equal(headerlessSingleHunk("just content\nmore content"), null); // no delimiter
+	assert.equal(headerlessSingleHunk(`b\n${D}\nB\n${D}`), null);           // two delimiters
+	assert.equal(headerlessSingleHunk(`${D}\nb\n${D}\nB\n${D}`), null);     // leading bare delimiter: already legal
+	assert.equal(headerlessSingleHunk(`b\n2 ${D}\nB`), null);               // numbered header present
+	assert.equal(headerlessSingleHunk(`   \n${D}\nnew`), null);             // nothing to anchor on
+});
+
+test("chain: the rejection no longer claims a block count it cannot know", () => {
+	const sk = chainSkeleton(`b\n${D}\nB\n${D}`, toLines("a\nb\nc"));
+	assert.match(sk, /the patch opens with content instead of a hunk header/);
+	assert.doesNotMatch(sk, /two or more blocks/);
 });

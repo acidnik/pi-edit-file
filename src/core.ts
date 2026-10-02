@@ -55,6 +55,9 @@ export interface Hunk {
 	after: string[];
 	/** Header was "NNN+ @@@": insert goes AFTER line NNN (inserts only). */
 	insertAfter?: boolean;
+	/** The patch had no leading header at all — "old <delim> new" with exactly
+	 * one delimiter line (see headerlessSingleHunk). */
+	leadingDelimiterOmitted?: boolean;
 }
 
 export type HunkKind = "replace" | "insert" | "delete";
@@ -127,6 +130,29 @@ export function parseHunkHeader(line: string): { hint: number | null; insertAfte
 	return null;
 }
 
+/** "old <delim> new" with the leading bare delimiter left out. Exactly one
+ * delimiter line means exactly one hunk — a chain needs at least two — so the
+ * reading is unambiguous: it is one replace whose header was forgotten, not a
+ * chain patch (2026-10-02 feedback). Anything else (no delimiter, several
+ * delimiters, or a numbered header somewhere) keeps the strict path. */
+export function headerlessSingleHunk(patch: string): Hunk | null {
+	const lines = patch.split("\n");
+	if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+	if (lines.some((line) => HEADER_RE.test(line))) return null;
+	const at = lines.findIndex((line) => delimiterRun(line) !== null);
+	if (at <= 0) return null; // no delimiter, or a leading bare delimiter (already legal)
+	if (lines.filter((line) => delimiterRun(line) !== null).length !== 1) return null;
+	const trimEdges = (xs: string[]) => {
+		const out = xs.slice();
+		while (out.length > 0 && out[0].trim() === "") out.shift();
+		while (out.length > 0 && out[out.length - 1].trim() === "") out.pop();
+		return out;
+	};
+	const before = trimEdges(lines.slice(0, at));
+	if (before.length === 0) return null;
+	return { hint: null, before, after: trimEdges(lines.slice(at + 1)), leadingDelimiterOmitted: true };
+}
+
 /**
  * Parse a patch string into hunks.
  * Throws EditError on grammar violations (with actionable messages).
@@ -135,6 +161,9 @@ export function parsePatch(patch: string): Hunk[] {
 	const lines = patch.split("\n");
 	// Drop a single trailing empty line produced by a final newline.
 	if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+
+	const headerless = headerlessSingleHunk(patch);
+	if (headerless) return [headerless];
 
 	const hunks: Hunk[] = [];
 	// The call's delimiter is the EXACT full-line run from its first header
@@ -346,8 +375,8 @@ export function chainSkeleton(patch: string, fileLines: string[]): string {
 	}
 
 	const out: string[] = [
-		`these blocks have no hunk header — that is the chain form ("old ${delimRun} new ${delimRun} old ${delimRun} new"), and it is not legal input: with two or more blocks every block needs its own header.`,
-		`A single block needs no number at all: start the patch with a bare "${delimRun}" line — allowed when the block appears exactly once in the file.`,
+		`the patch opens with content instead of a hunk header, and the chain form ("old ${delimRun} new ${delimRun} old ${delimRun} new") is not legal input — every block needs its own header.`,
+		`A block that occurs exactly once in the file needs no number: start the patch with a bare "${delimRun}" line.`,
 		"Here is the same edit with the headers filled in — paste your blocks between the header and delimiter lines:",
 		"",
 	];
@@ -1197,6 +1226,11 @@ export function reportCaveats(resolved: ResolvedHunk[], numbers?: number[]): str
 	if (resolved.length > 1) {
 		out.push(
 			"note: every hunk of one call matches the ORIGINAL file numbering — the out-numbers are for a follow-up call, not for the other hunks of this one.",
+		);
+	}
+	if (resolved.some((r) => r.hunk.leadingDelimiterOmitted)) {
+		out.push(
+			"note: the patch had no leading hunk header. One delimiter makes that unambiguous, so it was read as a single replace — write a bare delimiter line (or \"NNN <delimiter>\") first to say it explicitly.",
 		);
 	}
 	return out;
