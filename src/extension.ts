@@ -42,6 +42,7 @@ import {
 	patchDelimiter,
 	reportCaveats,
 	insertTip,
+	appliedLine,
 } from "./core.ts";
 
 const TOOL_NAME = "edit_file";
@@ -76,11 +77,11 @@ export const maxRetries = 3
 - Replace: NNN is where the old block starts in the file — a hint, not a strict address; the block itself is found by content (see Matching below). It may be omitted entirely, and then the block must occur exactly once.
 - The patch is a JSON string: one patch line is one file line. Never type "\\n" yourself — write real line breaks. Backticks, \${...} and quotes need no escaping.
 - @@@: delimiter, 3+ repetitions of one char from @ # % $ ~ ^ = +. The EXACT run from the first header is the call's delimiter on every line; a content line that equals it splits the block — escalate to a longer run (####) for the whole call (then "@@@" stays content).
-- Empty old block → insert, empty new block → delete, otherwise → replace. "NNN+ @@@" is inserts only; a replace anchors its matched block itself. A hunk whose old block equals its new block is skipped with a note.
+- Empty old block → insert, empty new block → delete, otherwise → replace. "NNN+ @@@" is inserts only; a replace anchors its matched block itself. A hunk whose old block equals its new block is a no-op: in a batch it is reported as SKIPPED, and a patch made only of no-ops is rejected with nothing written.
 
-Matching (per hunk, against the ORIGINAL file content): exact block match, then trimmed lines, then whitespace-collapsed lines. Searched first within ±20 lines of NNN, then the whole file. The match nearest to NNN wins, where the distance is measured to the matched RANGE (a hint inside the block means distance 0). Two matches at the same distance → the patch is rejected as ambiguous; distinct candidates are listed in the report. Every hunk of one call is matched against that same original text: the out-numbers of an earlier hunk of the same call are NOT valid hints for a later one, they are for a follow-up call. All hunks must match; overlapping hunks are rejected; the whole edit is atomic — on any failure the batch is rejected as a whole and the report states the fate of every hunk (nothing is written).
+Matching (per hunk, against the ORIGINAL file content): exact block match, then trimmed lines, then whitespace-collapsed lines, each time across the WHOLE file. The block must match exactly once — several matches make the patch fail with the candidate lines listed, and no hint chooses between them; extend the block with surrounding lines instead. NNN is only where you expect the block: the distance to the matched RANGE (0 when the hint falls inside the block) is reported as "hint N off by K". Every hunk of one call is matched against that same original text: the out-numbers of an earlier hunk of the same call are NOT valid hints for a later one, they are for a follow-up call. All hunks must match; overlapping hunks are rejected; the whole edit is atomic — on any failure the batch is rejected as a whole, nothing is written, and the report states the fate of every hunk.
 
-The report tells you how each hunk matched, e.g. "replace src 69-72 → out 69-73 (4 → 5 lines), exact match, hint 20 off by 49 [LOW CONFIDENCE: matched outside the ±20 line window]": src = line numbers in the original file, out = in the resulting file. A hunk whose anchor was off gets a "note:" line above the per-hunk reports, naming both the hint and the src lines it matched; "also matches at lines …" warns about identical snippets elsewhere; "indentation: …" warns that the inserted lines use a different indent style than the file. The last line may also point out a shorter form ("NNN+ @@@") when an insert was written as a replace.
+The report opens with "applied — N of M hunk(s), file written" on success and "batch rejected — 0 of M hunk(s) applied, nothing was written to the file" on failure, then one line per hunk, e.g. "hunk 1: replace src 69-72 → out 69-73 (4 → 5 lines), exact match, hint 20 off by 49": src = line numbers in the original file, out = in the resulting file. A hint that was off gets a "note:" line above the per-hunk reports, stating that the block was found by content and is unique; "indentation: …" warns that the inserted lines use a different indent style than the file. The last line may also point out a shorter form ("NNN+ @@@") when an insert was written as a replace.
 
 A hunk whose old block exactly equals its new block (no-op) is skipped with a note; the rest of the batch applies.
 
@@ -175,18 +176,24 @@ export default function editFileExtension(pi: { registerTool: (t: unknown) => vo
 				throw err;
 			}
 
-			// No-op hunks (before == after, exact) are skipped with a note instead
-			// of killing the batch or silently doing busywork.
+			// No-op hunks (before == after, exact) carry no change at all. Inside a
+			// batch each is skipped with a loud note; a patch made ONLY of them is
+			// rejected — such a patch means the author copied the wrong lines, and
+			// that signal must never come back as a success (Nik, 2026-10-02).
 			const active: Array<{ hunk: Hunk; origIndex: number }> = [];
 			const noOpNotes: string[] = [];
 			parsed.forEach((h, i) => {
-				if (isNoOpHunk(h)) noOpNotes.push(`hunk ${i + 1}: no-op (before == after) — skipped`);
+				if (isNoOpHunk(h)) noOpNotes.push(`hunk ${i + 1}: SKIPPED — no-op (the old block equals the new block); this hunk changes nothing`);
 				else active.push({ hunk: h, origIndex: i });
 			});
 			if (active.length === 0) {
-				const text = `${noOpNotes.join("\n")}\nnothing to change (all hunks are no-ops)\nfile: ${params.path} — untouched`;
-				return { content: [{ type: "text", text }], details: { path: absPath, hunks: [], reportLines: noOpNotes, totalLines: (readLines(absPath).lines.length), diff: "", diffTruncated: false } };
+				throw new EditError(
+					`nothing applied — every hunk of this patch is a no-op (the old block equals the new block), so the file was NOT written.\n` +
+						`${noOpNotes.join("\n")}\n` +
+						`Check that the old block is the text you mean to replace, and that the new block differs from it.`,
+				);
 			}
+			const totalHunks = parsed.length;
 			parsed = active.map((x) => x.hunk);
 			const hunkNumbers = active.map((x) => x.origIndex);
 
@@ -209,7 +216,8 @@ export default function editFileExtension(pi: { registerTool: (t: unknown) => vo
 				// hunk numbers stay the patch's original numbering across no-op skips
 				const reportLines = [...caveats, ...formatHunkReports(resolved, hunkNumbers)];
 				const summary =
-					`${[...reportLines, ...noOpNotes].join("\n")}\nsrc = original file, out = resulting file\n` +
+					`${[appliedLine(resolved.length, totalHunks), ...reportLines, ...noOpNotes].join("\n")}\n` +
+					`src = original file, out = resulting file\n` +
 					`follow-up edits: use the out-numbers from this report as hints — they match the file as it is now`;
 
 				const diffText = sequentialDiffs(file.lines, resolved)

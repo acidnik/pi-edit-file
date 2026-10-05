@@ -75,10 +75,11 @@ export interface MatchInfo {
 	/** Distance to the hint (0 when the hint is inside the block; 0 when
 	 * there was no hint, since a hintless block must be unique). */
 	distance: number;
-	/** Matched outside the ±WINDOW hint window (low confidence). */
+	/** The block matched further than ±WINDOW from the hint: the hint number was
+	 * stale. Reported as a fact ("hint 20 off by 49") — a unique block far from
+	 * the hint is still applied (2026-10-02 feedback: no "low confidence"
+	 * framing, which pushed the model to abandon the tool). */
 	farFromHint: boolean;
-	/** Other places the same block matches (1-based), closest first. */
-	otherMatches?: number[];
 	/** Set when the inserted lines use a different indent style than the file. */
 	indentMismatch?: string;
 }
@@ -444,19 +445,14 @@ function blockMatches(lines: string[], start: number, before: string[], eq: Line
 	return true;
 }
 
-function findCandidates(lines: string[], before: string[], hint: number | null, eq: LineEq): number[] {
+/** Every place the block matches at this tier — always the WHOLE file. The hint
+ * is not a search filter: a copy outside the hint window still makes the block
+ * non-unique, and a non-unique block is never resolved by proximity
+ * (2026-10-02 feedback). The hint only measures how far the found block sits
+ * from where it was expected. */
+function findCandidates(lines: string[], before: string[], eq: LineEq): number[] {
 	const cands: number[] = [];
-	// Without a hint there is nothing to be near to: scan the whole file.
-	const lo = hint === null ? 0 : Math.max(0, hint - 1 - WINDOW);
-	const hi = hint === null ? lines.length - before.length : Math.min(lines.length - before.length, hint - 1 + WINDOW);
-	// Window pass first (nearest wins anyway, but the window pass decides
-	// whether we trust proximity or must scan the whole file).
-	for (let s = lo; s <= hi; s++) {
-		if (blockMatches(lines, s, before, eq)) cands.push(s);
-	}
-	if (cands.length > 0) return cands;
 	for (let s = 0; s + before.length <= lines.length; s++) {
-		if (s >= lo && s <= hi) continue; // already checked
 		if (blockMatches(lines, s, before, eq)) cands.push(s);
 	}
 	return cands;
@@ -733,7 +729,7 @@ function resolveOne(hunk: Hunk, fileLines: string[], index: number): { ok: Resol
 	let candidates: number[] | null = null;
 	let tier: MatchTier = "exact";
 	for (const level of LADDER) {
-		const c = findCandidates(fileLines, hunk.before, hint, level.eq);
+		const c = findCandidates(fileLines, hunk.before, level.eq);
 		if (c.length > 0) {
 			candidates = c;
 			tier = level.name as MatchTier;
@@ -765,60 +761,32 @@ function resolveOne(hunk: Hunk, fileLines: string[], index: number): { ok: Resol
 		};
 	}
 
-	// Closest to the hint wins; a distance tie is ambiguous.
-	// Distance is measured to the matched RANGE (0 when the hint falls inside
-	// the block), not to its first line — that is what "how far is this block
-	// from where I asked" means to the caller.
-	const distOf = (start: number) => rangeDistance(start, start + hunk.before.length, hint);
-	let best = candidates[0];
-	let bestDist = distOf(best);
-	for (const c of candidates) {
-		const d = distOf(c);
-		if (d < bestDist || (d === bestDist && c < best)) {
-			best = c;
-			bestDist = d;
-		}
-	}
-	// A hintless hunk (bare delimiter header) has no proximity to fall back on:
-	// it must match exactly once, or the caller has to say where it means.
-	if (hint === null && candidates.length > 1) {
-		const list = candidates.map((c) => `${c + 1}`).join(", ");
+	// The before-block itself must be unique: a repeated block is NEVER resolved
+	// by the hint. Picking the copy nearest the hint is exactly the silent
+	// misapplication this tool exists to prevent (2026-10-02 feedback: "not
+	// unique" has to be an error, not a report line next to the applied ones).
+	if (candidates.length > 1) {
+		const shown = candidates.slice(0, 5);
+		const more = candidates.length > 5 ? ` … and ${candidates.length - 5} more` : "";
 		return {
 			fail: {
 				index,
 				hint,
 				kind,
-				reason: `no NNN hint given and the block matches at lines ${list}`,
+				reason: `not unique — the before-block matches at lines ${shown.map((c) => c + 1).join(", ")}${more} (${tier} match, ${candidates.length} copies)`,
 				detail:
-					`\nAdd a line number to the header (e.g. "${candidates[0] + 1} @@@") to pick one, ` +
-					`or include more surrounding lines in the before-block so the match is unique.`,
+					"\nInclude more surrounding lines in the before-block so it matches exactly once — " +
+					"a line number cannot choose between identical blocks.",
 				wouldMatch: { from: candidates[0] + 1, to: candidates[0] + hunk.before.length, tier },
 			},
 		};
 	}
 
-	const ties = candidates.filter((c) => distOf(c) === bestDist);
-	if (ties.length > 1) {
-		const list = ties.map((c) => `${c + 1}`).join(", ");
-		return {
-			fail: {
-				index,
-				hint,
-				kind,
-				reason: `ambiguous — block matches at lines ${list}, equally close to the hint`,
-				detail: "\nAdd surrounding unique lines to the before-block to disambiguate.",
-				wouldMatch: { from: best + 1, to: best + hunk.before.length, tier },
-			},
-		};
-	}
-
-	const others = hint === null
-		? []
-		: candidates
-				.filter((c) => c !== best)
-				.sort((a, b) => distOf(a) - distOf(b))
-				.slice(0, 5)
-				.map((c) => c + 1);
+	// Distance is measured to the matched RANGE (0 when the hint falls inside the
+	// block), not to its first line — that is what "how far is this block from
+	// where I asked" means to the caller, and what "hint N off by K" reports.
+	const best = candidates[0];
+	const bestDist = rangeDistance(best, best + hunk.before.length, hint);
 
 	return {
 		ok: {
@@ -833,7 +801,6 @@ function resolveOne(hunk: Hunk, fileLines: string[], index: number): { ok: Resol
 				hint,
 				distance: bestDist,
 				farFromHint: bestDist > WINDOW,
-				otherMatches: others.length > 0 ? others : undefined,
 				indentMismatch: indentMismatch(fileLines, best, hunk),
 			},
 		},
@@ -1119,12 +1086,8 @@ export function formatHunkReport(r: ResolvedHunk, index: number, outFrom: number
 			? ""
 			: `, hint ${r.match.hint} off by ${r.match.distance}`;
 	const hintless = r.match.hint === null && r.match.tier !== "hint" ? ", unique match (no hint given)" : "";
-	const warn = r.match.farFromHint ? " [LOW CONFIDENCE: matched outside the ±20 line window]" : "";
-	const others = r.match.otherMatches?.length
-		? ` [also matches at line${r.match.otherMatches.length === 1 ? "" : "s"} ${r.match.otherMatches.join(", ")} — verify the right one]`
-		: "";
 	const indent = r.match.indentMismatch ? ` [indentation: ${r.match.indentMismatch} — the new lines keep the patch's style]` : "";
-	return `hunk ${index + 1}: ${label} ${srcRange} → ${outRange} (${r.hunk.before.length} → ${r.hunk.after.length} lines)${tier}${hintless}${off}${warn}${others}${indent}`;
+	return `hunk ${index + 1}: ${label} ${srcRange} → ${outRange} (${r.hunk.before.length} → ${r.hunk.after.length} lines)${tier}${hintless}${off}${indent}`;
 }
 
 /** Per-hunk unified-style diff with a couple of context lines. */
@@ -1211,17 +1174,28 @@ export function formatHunkReports(resolved: ResolvedHunk[], numbers?: number[]):
 	return resolved.map((r, i) => formatHunkReport(r, numbers ? numbers[i] : i, outStart.get(r) ?? r.start + 1));
 }
 
-/** Advisory lines printed ABOVE the per-hunk reports. A hunk whose anchor is off
- * was matched by CONTENT, so the edit landed where the block is — but the
- * model's numbering was stale (2026-10-01 feedback: a second hunk numbered by
- * the first hunk's result lines). Distance 0 and exact-hint matches are silent. */
+/** First line of a successful report. It mirrors the rejection line ("batch
+ * rejected — 0 of N hunk(s) applied, nothing was written to the file"), so
+ * "applied and unique" vs "not found / not unique" is the first thing read
+ * (2026-10-02 feedback: that contrast is what keeps a model on this tool).
+ * Skipped no-op hunks are not counted here — they have their own SKIPPED line. */
+export function appliedLine(applied: number, total: number): string {
+	return `applied — ${applied} of ${total} hunk${total === 1 ? "" : "s"}, file written`;
+}
+
+/** Advisory lines printed ABOVE the per-hunk reports. A hunk whose anchor was off
+ * was matched by CONTENT and by uniqueness, so the edit landed at the block
+ * itself — the model's line number was stale (2026-10-01 feedback: a second hunk
+ * numbered by the first hunk's result lines). Phrased as the fact it is, not as
+ * a danger warning (2026-10-02 feedback). Distance-0 matches are silent. */
 export function reportCaveats(resolved: ResolvedHunk[], numbers?: number[]): string[] {
 	const out: string[] = [];
 	resolved.forEach((r, i) => {
 		if (r.match.tier === "hint" || r.match.hint === null || r.match.distance === 0) return;
 		const at = r.kind === "insert" ? `src line ${r.match.from}` : `src ${r.match.from}-${r.match.to}`;
-		const window = r.match.farFromHint ? " — outside the ±20-line window, verify it is the right block" : "";
-		out.push(`note: hunk ${(numbers ? numbers[i] : i) + 1}'s anchor ${r.match.hint} was off by ${r.match.distance}: the block matched by content at ${at}${window}.`);
+		out.push(
+			`note: hunk ${(numbers ? numbers[i] : i) + 1}'s hint ${r.match.hint} was off by ${r.match.distance} — the block was found by content and is unique, so the edit was applied at ${at}.`,
+		);
 	});
 	if (resolved.length > 1) {
 		out.push(

@@ -48,10 +48,10 @@ Loaded from a package, `edit_file` withdraws pi's built-in `edit` tool (same nam
 
 ## Patch format
 
-- `NNN` — 1-based line number where the old block starts. It is an **anchor hint, not a requirement**: the nearest match wins. It may be omitted entirely — start the hunk with a bare `@@@` and the block must then match exactly once in the file (an insert still needs `NNN`, since there is no block to match).
+- `NNN` — 1-based line number where the old block starts. It is an **anchor hint, not a requirement**: the old block itself must be unique (see Matching), and `NNN` only says where you expect it. It may be omitted entirely — start the hunk with a bare `@@@` (an insert still needs `NNN`, since there is no block to match).
 - `@@@` — delimiter: 3+ repetitions of one character from `@ # % $ ~ ^ = +`. The character is fixed by the first delimiter and must stay the same for the whole call; escalate to a longer run (`####`) when the file content contains a line like `@@@`.
 - A patch that opens with content and holds exactly one delimiter line is read as **one replace hunk** — the leading header was left out, and one delimiter cannot express a chain. Two or more delimiters without headers are still rejected, and the reply rebuilds the blocks with real headers.
-- Empty old block → **insert**: `NNN @@@` inserts **before** line `NNN`, `NNN+ @@@` inserts **after** it (append when `NNN` is past the end). Empty new block → **delete**. Otherwise → **replace**. A hunk whose old block equals its new block is skipped with a note.
+- Empty old block → **insert**: `NNN @@@` inserts **before** line `NNN`, `NNN+ @@@` inserts **after** it (append when `NNN` is past the end). Empty new block → **delete**. Otherwise → **replace**. A hunk whose old block equals its new block is a no-op: in a batch it is reported as `SKIPPED`, and a patch made only of no-ops is **rejected** — nothing is written.
 - The patch is a JSON string: one patch line is one file line. You never type `\n` yourself — write real line breaks. Backticks, `${...}` and quotes need no escaping.
 - A line that *looks* like a hunk header (`NNN` followed by the delimiter — e.g. a line of documentation about this format) starts the next hunk, so it cannot be block content: keep such lines out of a patch, or write them with a leading space and clean up in a second call.
 
@@ -74,28 +74,29 @@ export const maxRetries = 3
 Per hunk, against the **original** file content:
 
 1. **exact** block match → 2. lines compared **trimmed** → 3. internal whitespace **collapsed**.
-2. Searched first within ±20 lines of `NNN`, then the whole file.
-3. The match nearest to `NNN` wins, where distance is measured **to the matched range** (a hint inside the block means distance 0).
-4. Two matches at the same distance → the whole batch is rejected as ambiguous; the candidates are listed.
-5. No hint given → the block must be unique; several matches are listed instead of guessed.
+2. Every tier scans the **whole file** — a copy far outside the hint window still counts.
+3. The block must match **exactly once**. Several matches → the batch is **rejected** with the candidate lines, whether or not `NNN` points at one of them; proximity never chooses a copy, so extend the block with surrounding lines instead.
+4. `NNN` only says where the block is expected: the distance to the matched range (0 when the hint falls inside the block) is reported as `hint N off by K`. Nothing else depends on it — a unique block far from its hint is applied.
+5. No hint given → the same uniqueness rule, reported as `unique match (no hint given)`.
 
 Indentation of the file is preserved for matched lines; `CRLF`/`LF` and the presence or absence of a final newline are preserved as well.
 
 ## What the model gets back
 
-A successful call reports every hunk with its tier, its real location, and the resulting line numbers (`src` = original file, `out` = resulting file):
+The first line is the verdict, and it mirrors the rejection line exactly, so "applied and unique" is never confused with "not found / not unique":
 
 ```
-note: hunk 1's anchor 20 was off by 49: the block matched by content at src 69-72 — outside the ±20-line window, verify it is the right block.
-hunk 1: replace src 69-72 → out 69-73 (4 → 5 lines), exact match, hint 20 off by 49 [LOW CONFIDENCE: matched outside the ±20 line window]
+applied — 2 of 2 hunks, file written
+note: hunk 1's hint 20 was off by 49 — the block was found by content and is unique, so the edit was applied at src 69-72.
+hunk 1: replace src 69-72 → out 69-73 (4 → 5 lines), exact match, hint 20 off by 49
 hunk 2: insert src line 100 → out line 101 (0 → 3 lines), trim match, unique match (no hint given)
 src = original file, out = resulting file
 file: src/widget.ts — now 205 lines (was 193)
 ```
 
-A `note:` line sits above the hunk reports whenever something about the match needs reading before the numbers: a stale anchor (hint and matched `src` lines are both named) and, in a multi-hunk call, the reminder that every hunk was matched against the original numbering — the `out`-numbers are for a follow-up call, never for a later hunk of the same one. The last line may also name a shorter form (`NNN+ @@@`) when an insert was written as a replace.
+A `note:` line sits above the hunk reports when something about the match needs reading before the numbers: a hint that was off (hint and matched `src` lines are both named, and the note says the block was found by content and is unique), and, in a multi-hunk call, the reminder that every hunk was matched against the original numbering — the `out`-numbers are for a follow-up call, never for a later hunk of the same one. The last line may also name a shorter form (`NNN+ @@@`) when an insert was written as a replace.
 
-`[LOW CONFIDENCE: …]` marks a match found outside the hint window; `[also matches at lines 12, 45 — verify the right one]` marks ambiguous snippets that were resolved by proximity; `[indentation: file indents with tabs, the patch's new lines use spaces]` marks a silent indent-style change (reported, never rewritten).
+`[indentation: file indents with tabs, the patch's new lines use spaces]` marks a silent indent-style change (reported, never rewritten). A skipped no-op hunk appears as `SKIPPED — no-op (the old block equals the new block)`; when every hunk is a no-op the call **fails** instead of reporting success.
 
 ### A rejected batch says so, and accounts for every hunk
 
@@ -125,6 +126,8 @@ Not-found is the most expensive failure because it is the one models retry blind
 | Unified-diff habit (`-old` / `+new`) | `this looks like a unified diff … the patch format needs a "@@@" delimiter between the old and new blocks` |
 | Typo in one character (`1000` → `1001`) | `closest line 2 (95% similar): "const timeout = 1000;"` |
 | Hand-written `\n` inside a line | `Escaping note: a literal "\n" in a before-line is a backslash followed by "n", not a line break …` |
+| Block occurs more than once in the file | `not unique — the before-block matches at lines 12, 45 (exact match, 2 copies)` + *include more surrounding lines … a line number cannot choose between identical blocks* |
+| Every hunk is a no-op (`before == after`) | `nothing applied — every hunk of this patch is a no-op …, so the file was NOT written` |
 | No hunk header at all (chain form), a header where the closing delimiter belongs, or an unterminated hunk | the blocks are located in the file and re-emitted as a ready-to-paste numbered skeleton (`NOT UNIQUE` / `NOT FOUND` placeholders when a block cannot be pinned), with the note that a single unique block may start with a bare delimiter line instead of a number |
 
 Grammar failures get the same treatment as not-found ones: the patch is never applied, and the reply rebuilds the model's own blocks into legal form instead of stopping at a parse error. Not-found failures also include the nearest candidate region with per-line `=` / `≠` markers, and a **ready-to-paste corrected hunk** built from the real file content:

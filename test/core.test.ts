@@ -22,6 +22,7 @@ import {
 	reportCaveats,
 	insertTip,
 	headerlessSingleHunk,
+	appliedLine,
 } from "../src/core.ts";
 
 const FILE = [
@@ -112,16 +113,20 @@ test("resolve: hint far off still finds whole-file match", () => {
 	assert.equal(out.reports[0].from, 8);
 });
 
-test("resolve: closest candidate wins over another match", () => {
+test("resolve: a repeated block is rejected even when one copy is closest", () => {
 	const lines = toLines("dup\ndup\nmid\ndup\ndup");
-	const out = runPatch("1 @@@\ndup\n@@@\nUNIQ\n@@@", lines);
-	assert.equal(out.reports[0].from, 1);
+	assert.throws(
+		() => runPatch("1 @@@\ndup\n@@@\nUNIQ\n@@@", lines),
+		/not unique — the before-block matches at lines 1, 2, 4, 5/,
+	);
 });
 
-test("resolve: ambiguity within window → error listing candidates", () => {
+test("resolve: the rejection lists every candidate and the tier", () => {
 	const lines = toLines("dup\ndup\nmid\ndup\ndup");
-	// hint 3 is exactly between line 2 and line 4
-	assert.throws(() => runPatch("3 @@@\ndup\n@@@\nUNIQ\n@@@", lines), /ambiguous/);
+	assert.throws(
+		() => runPatch("3 @@@\ndup\n@@@\nUNIQ\n@@@", lines),
+		/not unique — the before-block matches at lines 1, 2, 4, 5 \(exact match, 4 copies\)/,
+	);
 });
 
 test("resolve: no match → error with context dump", () => {
@@ -284,15 +289,15 @@ test("resolve: diff-style after-block with trailing delimiter gets hint", () => 
 });
 
 test("batch reject: reports fate of every hunk and states nothing was written", () => {
-	const lines = toLines("dup\ndup\nmid\ndup\ndup\n");
+	const lines = toLines("dup\ndup\nmid\ndup\ndup\nUNIQ TARGET\n");
 	let msg = "";
 	try {
-		runPatch("3 @@@\ndup\n@@@\nUNIQ\n@@@\n5 @@@\ndup\n@@@\nLAST\n@@@", lines);
+		runPatch("3 @@@\ndup\n@@@\nUNIQ\n@@@\n6 @@@\nUNIQ TARGET\n@@@\nLAST\n@@@", lines);
 	} catch (e) {
 		msg = (e as Error).message;
 	}
 	assert.match(msg, /0 of 2 hunk\(s\) applied, nothing was written/);
-	assert.match(msg, /hunk 1: REJECTED — ambiguous/);
+	assert.match(msg, /hunk 1: REJECTED — not unique/);
 	assert.match(msg, /hunk 2: would have matched .*NOT applied/);
 });
 
@@ -354,29 +359,39 @@ test("not found: missing line suggestion keeps the model's after-block", () => {
 	assert.match(msg, /B2/);
 });
 
-test("match info: alternative match locations are surfaced (repetitive snippets)", () => {
+test("not unique: a repeated block is rejected even when the hint is nearest", () => {
 	const lines = toLines("dup\ndup\nmid\ndup\ndup\n");
-	// hint 2: nearest is line 2, but line 1/4/5 also match the same snippet
-	const resolved = resolveHunks(parsePatch("2 @@@\ndup\n@@@\nUNIQ\n@@@"), lines);
-	assert.equal(resolved[0].match.from, 2);
-	assert.deepEqual(resolved[0].match.otherMatches, [1, 4, 5]);
-
-	const report = formatHunkReports(resolved)[0];
-	assert.match(report, /also matches at lines 1, 4, 5 — verify the right one/);
+	// hint 2 is nearest to the copy at line 2, but the snippet also sits at 1, 4, 5:
+	// proximity never picks a copy (2026-10-02 — "not unique" is an error).
+	assert.throws(
+		() => resolveHunks(parsePatch("2 @@@\ndup\n@@@\nUNIQ\n@@@"), lines),
+		/not unique — the before-block matches at lines 1, 2, 4, 5 \(exact match, 4 copies\)/,
+	);
 });
 
-test("match info: unique match has no alternative list", () => {
+test("not unique: a copy outside the hint window still blocks the edit", () => {
+	// the second copy is 46 lines past the hint: the search is file-wide, so the
+	// hint window cannot hide it.
+	const rows = Array.from({ length: 60 }, (_, i) => (i === 4 || i === 50 ? "TARGET" : `line ${i + 1}`));
+	assert.throws(
+		() => resolveHunks(parsePatch(`5 @@@\nTARGET\n${D}\nX\n${D}`), toLines(rows.join("\n"))),
+		/not unique — the before-block matches at lines 5, 51/,
+	);
+});
+
+test("match info: a unique match reports no alternatives and no warning", () => {
 	const resolved = resolveHunks(parsePatch("2 @@@\nbbb\n@@@\nB\n@@@"), toLines("aaa\nbbb\nccc\n"));
-	assert.equal(resolved[0].match.otherMatches, undefined);
-	assert.doesNotMatch(formatHunkReports(resolved)[0], /also matches/);
+	const report = formatHunkReports(resolved)[0];
+	assert.match(report, /exact match/);
+	assert.doesNotMatch(report, /also matches|LOW CONFIDENCE/);
 });
 
-test("ambiguity: equal distance to the matched RANGE is a hard error", () => {
+test("ambiguity: identical blocks are a hard error whatever the hint says", () => {
 	// two byte-identical blocks flanking the hint (one line away from each)
 	const lines = toLines("a\n.name {\n\tflex: 1;\n}\nb\n.name {\n\tflex: 1;\n}\n");
 	assert.throws(
 		() => runPatch("5 @@@\n.name {\n\tflex: 1;\n}\n@@@\n.name {\n\tflex: 9;\n}\n@@@", lines),
-		/ambiguous — block matches at lines 2, 6, equally close to the hint/,
+		/not unique — the before-block matches at lines 2, 6 \(exact match, 2 copies\)/,
 	);
 });
 
@@ -590,7 +605,7 @@ test("hintless: bare @@@ header works when the block is unique", () => {
 	assert.match(out.lines[0], /replace src 2-2 → out 2-2 \(1 → 1 lines\), exact match, unique match \(no hint given\)/);
 });
 
-test("hintless: two matching blocks require NNN", () => {
+test("hintless: two matching blocks are rejected with an explanation", () => {
 	const lines = toLines("a\n.name {\n\tflex: 1;\n}\nb\n.name {\n\tflex: 1;\n}\n");
 	let msg = "";
 	try {
@@ -598,8 +613,8 @@ test("hintless: two matching blocks require NNN", () => {
 	} catch (e) {
 		msg = (e as Error).message;
 	}
-	assert.match(msg, /no NNN hint given and the block matches at lines 2, 6/);
-	assert.match(msg, /Add a line number to the header/);
+	assert.match(msg, /not unique — the before-block matches at lines 2, 6 \(exact match, 2 copies\)/);
+	assert.match(msg, /Include more surrounding lines in the before-block so it matches exactly once/);
 });
 
 test("hintless: an insert without NNN is rejected with an explanation", () => {
@@ -815,6 +830,13 @@ test("parse: delimiter-missing errors carry codes for the skeleton path", () => 
 	assert.equal(patchDelimiter(`1 @@@\na\n@@@\nb\n@@@`), "@@@");
 });
 
+test("report: the applied line mirrors the rejection line", () => {
+	assert.equal(appliedLine(2, 2), "applied — 2 of 2 hunks, file written");
+	assert.equal(appliedLine(1, 1), "applied — 1 of 1 hunk, file written");
+	// a no-op hunk was skipped: applied < total is the loud part
+	assert.equal(appliedLine(1, 3), "applied — 1 of 3 hunks, file written");
+});
+
 test("delimiter: patchDelimiter returns the call's run", () => {
 	assert.equal(patchDelimiter(`2 @@@\na\n@@@\nA\n@@@`), "@@@");
 	assert.equal(patchDelimiter(`2 ####\na\n####\nA\n####`), "####");
@@ -834,20 +856,22 @@ test("caveats: exact-hint and distance-0 matches are silent", () => {
 	assert.deepEqual(reportCaveats(resolveHunks(parsePatch(`2 @@@\n@@@\nNEW\n${D}`), file)), []);
 });
 
-test("caveats: an off-by anchor names the hint and the matched src range", () => {
+test("caveats: an off-by hint is reported as a fact, not as a warning", () => {
 	const file = toLines("a\nb\nc\nd\ne");
 	const caveats = reportCaveats(resolveHunks(parsePatch(`5 @@@\nb\nc\n${D}\nB\nC\n${D}`), file));
 	assert.equal(caveats.length, 1);
-	assert.match(caveats[0], /hunk 1's anchor 5 was off by 2: the block matched by content at src 2-3\./);
-	assert.doesNotMatch(caveats[0], /outside the ±20-line window/);
+	assert.match(caveats[0], /hunk 1's hint 5 was off by 2 — the block was found by content and is unique, so the edit was applied at src 2-3\./);
+	assert.doesNotMatch(caveats[0], /verify|confidence|±20/i);
 });
 
-test("caveats: an anchor beyond ±20 adds the window warning", () => {
+test("caveats: a unique block far from its hint is applied and stated plainly", () => {
 	const file = Array.from({ length: 40 }, (_, i) => `line ${i + 1}`);
-	const caveats = reportCaveats(resolveHunks(parsePatch(`1 @@@\nline 35\n${D}\nX\n${D}`), file));
-	assert.equal(caveats.length, 1);
-	assert.match(caveats[0], /off by 34: the block matched by content at src 35-35/);
-	assert.match(caveats[0], /outside the ±20-line window, verify it is the right block/);
+	const resolved = resolveHunks(parsePatch(`1 @@@\nline 35\n${D}\nX\n${D}`), file);
+	assert.equal(resolved[0].match.farFromHint, true); // kept as data, never as a warning
+	assert.match(reportCaveats(resolved)[0], /hint 1 was off by 34 — the block was found by content and is unique, so the edit was applied at src 35-35\./);
+	const line = formatHunkReports(resolved)[0];
+	assert.match(line, /hint 1 off by 34/);
+	assert.doesNotMatch(line, /LOW CONFIDENCE/);
 });
 
 test("caveats: a multi-hunk call gets the original-numbering note", () => {
@@ -862,7 +886,7 @@ test("caveats: a multi-hunk call gets the original-numbering note", () => {
 test("caveats: restored hunk numbers are used in the note", () => {
 	const file = toLines("a\nb\nc\nd\ne");
 	const caveats = reportCaveats(resolveHunks(parsePatch(`5 @@@\nb\nc\n${D}\nB\nC\n${D}`), file), [1]);
-	assert.match(caveats[0], /hunk 2's anchor/);
+	assert.match(caveats[0], /hunk 2's hint/);
 });
 
 test("tip: an append written as a replace points at NNN+", () => {
@@ -930,7 +954,7 @@ test("headerless: the canonical bare form gets no nudge", () => {
 
 test("headerless: an ambiguous block is still rejected, never auto-picked", () => {
 	const file = toLines("same\nsame\nx\nsame\nsame");
-	assert.throws(() => resolveHunks(parsePatch(`same\n${D}\nnew`), file), /no NNN hint given and the block matches at lines/);
+	assert.throws(() => resolveHunks(parsePatch(`same\n${D}\nnew`), file), /not unique — the before-block matches at lines/);
 });
 
 test("headerless: the helper stays out when the reading is not unambiguous", () => {

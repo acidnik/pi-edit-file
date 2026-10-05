@@ -302,3 +302,44 @@ chain-form с текстом «with two or more blocks every block needs its own
   «the patch opens with content instead of a hunk header, and the chain form … is
   not legal input — every block needs its own header», и рядом по-прежнему
   подсказка про голый делимитер для одиночного уникального блока.
+
+## 13. Строгая уникальность, явный вердикт, no-op как ошибка (фидбек 2026-10-02)
+
+Фидбек: «что бы меня удержало на edit_file» — (1) явное различие между
+«применено и уникально» и «якорь не найден / не уникален», причём второе как
+ошибка, а не строка в отчёте; (2) отказ принимать патч, где before == after,
+держать громким; (3) `LOW CONFIDENCE: matched outside the ±20 line window`
+переформулировать как «применено, якорь уникален, номер строки не совпал с
+подсказкой» — в прежней формулировке это читалось как предупреждение об
+опасности и уводило в другой инструмент.
+
+Решения (подтверждены Ником): уникальность — строгая; no-op-отказ — только
+когда no-op'ов весь патч.
+
+- **Строгая уникальность.** Резолвер требовал уникальности только при
+  отсутствии подсказки и при равенстве расстояний; в остальных случаях
+  выбиралась копия, ближайшая к NNN, а в отчёте появлялась строка
+  `[also matches at lines … — verify the right one]`. Теперь любое число
+  кандидатов > 1 — отказ: `not unique — the before-block matches at lines …, (tier
+  match, N copies)` + совет расширить блок контекстом («a line number cannot
+  choose between identical blocks»). `findCandidates` сканирует файл целиком на
+  каждом тире: копия за пределами окна ±20 больше не «невидима». Из `MatchInfo`
+  удалён `otherMatches`, из отчёта — обе прежние скобки (`also matches` и
+  `LOW CONFIDENCE`). NNN остался только мерой «насколько номер разошёлся с
+  реальностью» (`farFromHint` сохранён как данные, но не рисуется как
+  предупреждение).
+- **Явный вердикт первой строкой.** Успех: `applied — N of M hunk(s), file
+  written` (`appliedLine()`), отказ: `batch rejected — 0 of M hunk(s) applied,
+  nothing was written to the file`. Строка-вердикт идёт ВЫШЕ caveats, чтобы
+  «применено» и «отклонено» нельзя было спутать, читая построчные строки.
+- **no-op.** В смешанном батче хунк остаётся пропущенным, но с громкой пометкой
+  `SKIPPED — no-op (the old block equals the new block); this hunk changes
+  nothing`; патч, целиком состоящий из no-op'ов, теперь **ошибка**:
+  `nothing applied — every hunk of this patch is a no-op …, so the file was NOT
+  written` (раньше это был успешный ответ «nothing to change», который прятал
+  сигнал «не те строки скопированы»). Проверка и фильтрация no-op'ов живут в
+  `extension.ts` (там же, где были), `isNoOpHunk()` — в ядре.
+- **Caveats читаются как факт**: `note: hunk 1's hint 20 was off by 49 — the
+  block was found by content and is unique, so the edit was applied at src
+  69-72.` Прилагательное «дальний якорь» больше не подаётся как риск: блок
+  уникален, а значит применён там, где он есть.
