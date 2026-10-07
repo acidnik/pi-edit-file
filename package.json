@@ -35,5 +35,10 @@
   "engines": {
     "node": ">=22.6.0"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/acidnik/pi-edit-file.git"
+  },
+  "author": "acidnik",
   "license": "MIT"
 }
