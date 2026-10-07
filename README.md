@@ -166,7 +166,7 @@ The same renderer is attached to a `write` override, so overwriting an existing 
 npm test
 ```
 
-99 tests over the pure core (parser, matching ladder, atomicity, diagnostics, report caveats, diff generation, CRLF handling). The core has no Pi imports, so it runs on plain Node ≥ 22.6 with the built-in type stripping.
+The suite covers the pure core (parser, matching ladder, atomicity, diagnostics, report caveats, diff generation, CRLF handling) — the count lives in the test output, not here, so it cannot go stale. The core has no Pi imports, so it runs on plain Node ≥ 22.6 with the built-in type stripping.
 
 ## License
 
