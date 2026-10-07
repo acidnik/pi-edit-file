@@ -252,8 +252,25 @@ export default function editFileExtension(pi: { registerTool: (t: unknown) => vo
 			return new Text(text, 0, 0);
 		},
 
-		renderResult(result: any, { expanded, isPartial }: { expanded: boolean; isPartial: boolean }, theme: any) {
+		renderResult(
+			result: any,
+			{ expanded, isPartial }: { expanded: boolean; isPartial: boolean },
+			theme: any,
+			context?: { isError?: boolean },
+		) {
 			if (isPartial) return new Text(theme.fg("warning", "Editing..."), 0, 0);
+
+			// A rejected patch carries its whole diagnosis in the error text and has
+			// no details, so the summary below would render as "+0 / -0 · 0 hunks"
+			// and swallow the reason (jup-degen session, 2026-10-07 — the model's
+			// workaround was visible, the cause was not).
+			if (context?.isError || result?.isError) {
+				const message = (result?.content ?? [])
+					.filter((c: any) => c?.type === "text")
+					.map((c: any) => c.text ?? "")
+					.join("\n");
+				return new Text(theme.fg("error", message || "edit_file failed"), 0, 0);
+			}
 
 			const details = result?.details as
 				| { path?: string; hunks?: unknown[]; reportLines?: string[]; totalLines?: number; diff?: string; diffTruncated?: boolean }

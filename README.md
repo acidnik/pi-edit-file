@@ -54,6 +54,7 @@ Loaded from a package, `edit_file` withdraws pi's built-in `edit` tool (same nam
 - Empty old block → **insert**: `NNN @@@` inserts **before** line `NNN`, `NNN+ @@@` inserts **after** it (append when `NNN` is past the end). Empty new block → **delete**. Otherwise → **replace**. A hunk whose old block equals its new block is a no-op: in a batch it is reported as `SKIPPED`, and a patch made only of no-ops is **rejected** — nothing is written.
 - The patch is a JSON string: one patch line is one file line. You never type `\n` yourself — write real line breaks. Backticks, `${...}` and quotes need no escaping.
 - A line that *looks* like a hunk header (`NNN` followed by the delimiter — e.g. a line of documentation about this format) starts the next hunk, so it cannot be block content: keep such lines out of a patch, or write them with a leading space and clean up in a second call.
+- Lines beginning with `-` or `+` are **ordinary content** — markdown bullets, list continuations, a diff quoted inside a document. They never make a patch invalid; the unified-diff hint only appears in a diagnosis, after such a block failed to match the file (2026-10-07: a bullet plus its `+18…` continuation was rejected as a diff and the whole patch was thrown away).
 
 Several hunks per call, applied atomically:
 
@@ -123,7 +124,7 @@ Not-found is the most expensive failure because it is the one models retry blind
 | Block lines exist, wrong order | `every line exists, but NOT in the order written` + actual position of each line |
 | Lines exist, not contiguous | `not contiguous — found at lines 41, 57 (expected consecutive lines)` |
 | New content written into the old block | `The first 9 line(s) match the file and the trailing 6 do not exist. If those trailing lines are the NEW content …` |
-| Unified-diff habit (`-old` / `+new`) | `this looks like a unified diff … the patch format needs a "@@@" delimiter between the old and new blocks` |
+| Unified-diff habit (`-old` / `+new`) | the block is diagnosed **after** it fails to match: *the block mixes N "-" marked line(s) with M "+" marked line(s) — that is a unified diff, not file content* + the shape of a replace patch |
 | Typo in one character (`1000` → `1001`) | `closest line 2 (95% similar): "const timeout = 1000;"` |
 | Hand-written `\n` inside a line | `Escaping note: a literal "\n" in a before-line is a backslash followed by "n", not a line break …` |
 | Block occurs more than once in the file | `not unique — the before-block matches at lines 12, 45 (exact match, 2 copies)` + *include more surrounding lines … a line number cannot choose between identical blocks* |
@@ -154,6 +155,8 @@ function f() {
 ## Rendering
 
 The UI draws the change as a unified diff with word-level highlighting (`details.diff`). The transcript card shows that diff plus a compact `+adds / -removals · N hunks` line — the per-hunk report, the anchor caveats and the shorter-form tip are written for the model and are **not** drawn next to the diff (Nik, 2026-10-01: "только сам дифф"). The model-facing content stays a summary, because models that see raw diffs in tool output start imitating the diff format in their own patches (this happened, and is why the escaping and diff-style diagnostics above exist).
+A failed call draws its **error text** instead: a patch rejection carries the whole diagnosis there, and rendering the empty result showed "+0 / -0 · 0 hunks", hiding the reason (2026-10-07).
+
 
 The same renderer is attached to a `write` override, so overwriting an existing file shows a diff of the old content instead of a bare "Successfully wrote to …".
 

@@ -229,10 +229,20 @@ test("sequentialDiffs: context reflects earlier hunks, headers rebased", () => {
 	assert.match(parts[1], /\+new2/);
 });
 
-test("parse: diff-style patch (missing middle delimiter) gets actionable error", () => {
-	// exactly what glm-5.3-flash wrote in session 2026-09-25: -old lines then +new, no @@@ between
+test("parse: a diff-style patch without a closing delimiter explains the markers", () => {
+	// exactly what glm-5.3-flash wrote in session 2026-09-25: -old lines then +new,
+	// with no delimiter at all. Marked lines are no longer a reason to reject a
+	// block up front (they can be real content, see the marked-lines tests); the
+	// hint rides on the diagnosis that fires for this patch anyway.
 	const diffStyle = "56 @@@\n-function saveCheckpoint(doneIds) {\n-  const done = [];\n+// --- checkpoint helpers ---";
-	assert.throws(() => parsePatch(diffStyle), /looks like a unified diff/);
+	let msg = "";
+	try {
+		parsePatch(diffStyle);
+	} catch (e) {
+		msg = (e as Error).message;
+	}
+	assert.match(msg, /unterminated hunk \(hint 56\) — missing closing "@@@" between the old and new blocks/);
+	assert.match(msg, /mixes 2 "-" marked line\(s\) with 1 "\+" marked line\(s\) — that is a unified diff/);
 });
 
 test("diagnose: missing line reported as absent (stale before-block)", () => {
@@ -969,4 +979,39 @@ test("chain: the rejection no longer claims a block count it cannot know", () =>
 	const sk = chainSkeleton(`b\n${D}\nB\n${D}`, toLines("a\nb\nc"));
 	assert.match(sk, /the patch opens with content instead of a hunk header/);
 	assert.doesNotMatch(sk, /two or more blocks/);
+});
+
+// ---------------------------------------------------------------------------
+// Marked lines are content, not a diff (jup-degen session, 2026-10-07)
+// ---------------------------------------------------------------------------
+
+test("marked lines: a '-' bullet with a '+' continuation line is applied", () => {
+	// The exact shape that was rejected as a unified diff: a markdown bullet and
+	// its continuation line starting with "+18…".
+	const file = toLines("keep\n- полоса 50-60 cents:\n  +18…+22 cents on 77-97 quotes;\ntail");
+	const patch = `@@@\n- полоса 50-60 cents:\n  +18…+22 cents on 77-97 quotes;\n@@@\n- полоса 50-60 cents:\n  +18…+24 cents on 77-97 quotes;\n@@@`;
+	const resolved = resolveHunks(parsePatch(patch), file);
+	assert.equal(
+		applyHunks(file, resolved).join("\n"),
+		"keep\n- полоса 50-60 cents:\n  +18…+24 cents on 77-97 quotes;\ntail",
+	);
+});
+
+test("marked lines: parsing never rejects them up front", () => {
+	const hunks = parsePatch("@@@\n- old line\n+ new line\n@@@");
+	assert.equal(hunks.length, 1);
+	assert.deepEqual(hunks[0].before, ["- old line", "+ new line"]);
+});
+
+test("unified diff: the habit is diagnosed after the block fails to match", () => {
+	const lines = toLines("const a = 1;\nconst b = 2;\n");
+	let msg = "";
+	try {
+		runPatch("@@@\n- const a = 1;\n+ const a = 2;\n@@@", lines);
+	} catch (e) {
+		msg = (e as Error).message;
+	}
+	assert.match(msg, /0 of 1 hunk\(s\) applied, nothing was written/);
+	assert.match(msg, /mixes 1 "-" marked line\(s\) with 1 "\+" marked line\(s\) — that is a unified diff/);
+	assert.match(msg, /A replace patch is: a header line, the old lines without "-"/);
 });

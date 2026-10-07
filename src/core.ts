@@ -206,19 +206,15 @@ export function parsePatch(patch: string): Hunk[] {
 		}
 		i++;
 
-		// Collect before-lines until the call's exact delimiter run.
+		// Collect before-lines until the call's exact delimiter run. Marked lines
+		// ("-" / "+") are NOT rejected here: legitimate content can hold a "-" line
+		// followed by a "+" line (a markdown bullet and its "+18…" continuation did
+		// exactly that in the jup-degen session, 2026-10-07, and the up-front guess
+		// threw the whole patch away). The unified-diff hint is given at diagnosis
+		// time instead, when the block really does not match the file (see
+		// resolveOne — it can only help there).
 		const before: string[] = [];
-		const bodyStart = i;
 		while (i < lines.length && !isOwnDelim(lines[i])) {
-			// Diff-style patch: the model mimicked a unified diff (-old / +new)
-			// and skipped the '@@@' delimiter between the old and new blocks.
-			if (i > bodyStart && /^\s*\+/.test(lines[i]) && before.some((l) => /^-\s?/.test(l) || /^-\s*$/.test(l))) {
-				throw new EditError(
-					`parse error at line ${i + 1}: this looks like a unified diff (-old / +new lines), but the patch format needs a "${delimRun}" delimiter between the old and new blocks:\n\n` +
-						`${hint}${header.insertAfter ? "+" : ""} ${delimRun}\n<old lines, no leading "-">\n${delimRun}\n<new lines, no leading "+">\n${delimRun}\n\n` +
-						`Strip the leading "-" and "+" markers and keep only the plain line contents.`,
-				);
-			}
 			if (HEADER_RE.test(lines[i])) {
 				throw new EditError(
 					`parse error at line ${i + 1}: hunk header found before the closing delimiter — missing "${delimRun}" separator?`,
@@ -230,7 +226,8 @@ export function parsePatch(patch: string): Hunk[] {
 		}
 		if (i >= lines.length) {
 			throw new EditError(
-				`parse error: unterminated hunk (${hintLabel(hint)}) — missing closing "${delimRun}" between the old and new blocks`,
+				`parse error: unterminated hunk (${hintLabel(hint)}) — missing closing "${delimRun}" between the old and new blocks` +
+					unifiedDiffHint(before),
 				"unterminated",
 			);
 		}
@@ -443,6 +440,25 @@ function blockMatches(lines: string[], start: number, before: string[], eq: Line
 		if (!eq(lines[start + k], before[k])) return false;
 	}
 	return true;
+}
+
+/** Unified-diff markers left inside a block. Returns the hint text when the lines
+ * look like a diff and "" otherwise. This is ONLY ever a diagnosis — "-" on one
+ * line and "+" on a later one is legal content, and treating it as a grammar
+ * error threw away a valid patch in the jup-degen session (2026-10-07: a markdown
+ * bullet plus its "+18…" continuation line). */
+function unifiedDiffHint(block: string[]): string {
+	const minus = block.filter((l) => /^\s*-\s?/.test(l) || /^\s*-\s*$/.test(l)).length;
+	const plus = block.filter((l) => /^\s*\+/.test(l)).length;
+	const shape =
+		"A replace patch is: a header line, the old lines without \"-\", a delimiter line, the new lines without \"+\", a delimiter line.";
+	if (minus > 0 && plus > 0) {
+		return `\nThe block mixes ${minus} "-" marked line(s) with ${plus} "+" marked line(s) — that is a unified diff, not file content. ${shape}`;
+	}
+	if (plus > 0) {
+		return `\nThe block contains ${plus} line(s) starting with "+" — this looks like a unified diff. ${shape}`;
+	}
+	return "";
 }
 
 /** Every place the block matches at this tier — always the WHOLE file. The hint
@@ -738,12 +754,11 @@ function resolveOne(hunk: Hunk, fileLines: string[], index: number): { ok: Resol
 	}
 
 	if (!candidates || candidates.length === 0) {
-		let diffStyleHint = "";
-		if (hunk.before.some((l) => /^\s*\+/.test(l))) {
-			diffStyleHint =
-				`\nThe before-block contains lines starting with "+" — this looks like a unified diff. ` +
-				`The patch format is: NNN @@@ / old lines (no "-") / @@@ / new lines (no "+") — write plain line contents without +/- markers.`;
-		}
+		// A unified-diff attempt is diagnosed here, AFTER the block failed to match
+		// — never as a parse-time guess: a "-" line followed by a "+" line is legal
+		// content (2026-10-07: a markdown bullet plus a "+18…" continuation line was
+		// mistaken for a diff and the whole patch was rejected).
+		const diffStyleHint = unifiedDiffHint(hunk.before);
 		const suggestion = suggestCorrection(fileLines, hunk, hint);
 		return {
 			fail: {
