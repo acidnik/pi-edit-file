@@ -663,9 +663,13 @@ function indentMismatch(fileLines: string[], start: number, hunk: Hunk): string 
 		: "file indents with spaces, the patch's new lines use tabs";
 }
 
-function contextDump(lines: string[], hint: number | null): string {
-	// Without a hint there is no centre; show the head of the file instead.
-	const center = hint === null ? Math.min(3, lines.length) : Math.min(Math.max(hint, 1), lines.length);
+/** Seven lines of the file centred on the hunk's hint. Only called with a hint:
+ * without one there is no place to centre on, and the head of the file is not
+ * context for a block that sits 200 lines further down (2026-10-08: a batch in
+ * executor.py dumped the same six head lines under two different failures, while
+ * the blocks belonged around lines 200+). */
+function contextDump(lines: string[], hint: number): string {
+	const center = Math.min(Math.max(hint, 1), lines.length);
 	const from = Math.max(0, center - 4);
 	const to = Math.min(lines.length, center + 3);
 	const pad = String(to).length;
@@ -767,9 +771,11 @@ function resolveOne(hunk: Hunk, fileLines: string[], index: number): { ok: Resol
 				kind,
 				reason: "before-block not found (exact, trim and whitespace-collapse matching all failed)",
 				detail:
-					`${diffStyleHint}${diagnoseBlock(fileLines, hunk.before, hint)}\n` +
-					(hint === null ? `File head:\n` : `Lines around ${hint}:\n`) +
-					`${contextDump(fileLines, hint)}` +
+					`${diffStyleHint}${diagnoseBlock(fileLines, hunk.before, hint)}` +
+					// The hint is the only thing that says where the block was meant to be.
+					// Without one the diagnosis above (per-line closest candidates, and the
+					// candidate region when there is one) is all the location there is.
+					(hint === null ? "" : `\nLines around ${hint}:\n${contextDump(fileLines, hint)}`) +
 					(suggestion ? `\n${suggestion.text}` : ""),
 				suggestion: suggestion?.patch,
 			},
@@ -881,10 +887,23 @@ export function resolveHunks(hunks: Hunk[], fileLines: string[]): ResolvedHunk[]
 		if (r) byIndex.set(i, r);
 	}
 	// Full detail for the first couple of failures; the rest stay one-line to
-	// keep the error readable for large batches.
+	// keep the error readable for large batches. An identical diagnosis is printed
+	// once — two failing hunks must not repeat the same six lines (2026-10-08).
 	const DETAIL_LIMIT = 2;
+	const printed = new Map<string, number>();
 	report.failures.forEach((f, k) => {
-		const detail = k < DETAIL_LIMIT ? f.detail : f.detail ? "\n(details omitted — fix the failures above first)" : "";
+		let detail = "";
+		if (k >= DETAIL_LIMIT) {
+			detail = f.detail ? "\n(details omitted — fix the failures above first)" : "";
+		} else if (f.detail) {
+			const seen = printed.get(f.detail);
+			if (seen === undefined) {
+				printed.set(f.detail, f.index + 1);
+				detail = f.detail;
+			} else {
+				detail = `\n(same diagnosis as hunk ${seen})`;
+			}
+		}
 		lines.push(`hunk ${f.index + 1}: REJECTED — ${f.reason}${detail}`);
 	});
 	for (let i = 0; i < hunks.length; i++) {

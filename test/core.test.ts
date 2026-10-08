@@ -1015,3 +1015,45 @@ test("unified diff: the habit is diagnosed after the block fails to match", () =
 	assert.match(msg, /mixes 1 "-" marked line\(s\) with 1 "\+" marked line\(s\) — that is a unified diff/);
 	assert.match(msg, /A replace patch is: a header line, the old lines without "-"/);
 });
+
+// ---------------------------------------------------------------------------
+// Diagnosis context: only where we know where the block was meant to be
+// (jup-degen executor.py, 2026-10-08)
+// ---------------------------------------------------------------------------
+
+test("context dump: a hintless failure shows no file head", () => {
+	const lines = toLines(Array.from({ length: 40 }, (_, i) => `line ${i + 1}`).join("\n"));
+	let msg = "";
+	try {
+		runPatch(`${D}\nmissing one\nmissing two\n${D}\nNEW\n${D}`, lines);
+	} catch (e) {
+		msg = (e as Error).message;
+	}
+	assert.match(msg, /2 of 2 before-block line\(s\) do not exist in the file at all/);
+	assert.doesNotMatch(msg, /File head/);
+});
+
+test("context dump: a hinted failure shows lines around the hint", () => {
+	const lines = toLines(Array.from({ length: 40 }, (_, i) => `line ${i + 1}`).join("\n"));
+	let msg = "";
+	try {
+		runPatch(`30 ${D}\nmissing one\n${D}\nNEW\n${D}`, lines);
+	} catch (e) {
+		msg = (e as Error).message;
+	}
+	assert.match(msg, /Lines around 30:/);
+	assert.match(msg, /30 \| line 30/);
+	assert.doesNotMatch(msg, /File head/);
+});
+
+test("rejection: an identical diagnosis is printed once", () => {
+	const lines = toLines("keep\ntail");
+	let msg = "";
+	try {
+		runPatch(`${D}\nmissing block\n${D}\nNEW\n${D}\n${D}\nmissing block\n${D}\nNEW\n${D}`, lines);
+	} catch (e) {
+		msg = (e as Error).message;
+	}
+	assert.equal(msg.match(/do not exist in the file at all/g)?.length, 1);
+	assert.match(msg, /\(same diagnosis as hunk 1\)/);
+});
