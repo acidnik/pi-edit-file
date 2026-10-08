@@ -240,14 +240,14 @@ export default function editFileExtension(pi: { registerTool: (t: unknown) => vo
 				const diffText = sequentialDiffs(file.lines, resolved)
 					.filter(Boolean)
 					.join("\n");
-				const { text: diff, truncated } = truncateDiff(diffText);
+				const { text: diff, truncated, additions, removals } = truncateDiff(diffText);
 
 				// No raw diff in model-facing content: models started mimicking the
 				// unified-diff format when writing patches (see pi-hermes-memory
 				// session 2026-09-25). The UI renders details.diff; the model gets
 				// the per-hunk summary only.
 				const text = `${summary}\nfile: ${params.path} — now ${updated.length} lines (was ${originalCount})`;
-				return { text, reports, reportLines, totalLines: updated.length, truncated, diff };
+				return { text, reports, reportLines, totalLines: updated.length, truncated, diff, additions, removals };
 			});
 
 			return {
@@ -259,6 +259,8 @@ export default function editFileExtension(pi: { registerTool: (t: unknown) => vo
 					totalLines: result.totalLines,
 					diff: result.diff,
 					diffTruncated: result.truncated,
+					diffAdditions: result.additions,
+					diffRemovals: result.removals,
 				},
 			};
 		},
@@ -290,16 +292,24 @@ export default function editFileExtension(pi: { registerTool: (t: unknown) => vo
 			}
 
 			const details = result?.details as
-				| { path?: string; hunks?: unknown[]; reportLines?: string[]; totalLines?: number; diff?: string; diffTruncated?: boolean }
+				| {
+						path?: string;
+						hunks?: unknown[];
+						reportLines?: string[];
+						totalLines?: number;
+						diff?: string;
+						diffTruncated?: boolean;
+						diffAdditions?: number;
+						diffRemovals?: number;
+				  }
 				| undefined;
 			const diff = details?.diff ?? "";
 			const diffLines = diff ? diff.split("\n") : [];
-			let additions = 0;
-			let removals = 0;
-			for (const line of diffLines) {
-				if (line.startsWith("+")) additions++;
-				if (line.startsWith("-")) removals++;
-			}
+			// The counts describe the FULL diff and arrive with the result; counting the
+			// rendered excerpt instead reported "+0" for a rewritten file (2026-10-08).
+			const counted = countDiffLines(diffLines);
+			const additions = details?.diffAdditions ?? counted.additions;
+			const removals = details?.diffRemovals ?? counted.removals;
 
 			const hunkCount = details?.hunks?.length ?? 0;
 			let text = theme.fg("success", `+${additions}`);
@@ -337,6 +347,19 @@ export default function editFileExtension(pi: { registerTool: (t: unknown) => vo
 	// Plugin-provided quick_edit / target_edit are deliberately left alone
 	// (Nik's decision, 2026-09-26): they stay as a fallback edit path.
 	registerWriteDiff(pi);
+}
+
+/** Line counts of a rendered diff excerpt; the stored full-diff stats win when
+ * present (see truncateDiff). Kept here so both renderers agree. */
+function countDiffLines(lines: string[]): { additions: number; removals: number } {
+	let additions = 0;
+	let removals = 0;
+	for (const line of lines) {
+		if (line.startsWith("+++") || line.startsWith("---")) continue;
+		if (line.startsWith("+")) additions++;
+		else if (line.startsWith("-")) removals++;
+	}
+	return { additions, removals };
 }
 
 const WRITE_TOOL_NAME = "write";
@@ -389,11 +412,11 @@ function registerWriteDiff(pi: { registerTool: (t: unknown) => void }) {
 
 			const diffText = unifiedDiff(before, params.content, params.path);
 			if (!diffText) return result;
-			const { text: diff, truncated } = truncateDiff(diffText);
+			const { text: diff, truncated, additions, removals } = truncateDiff(diffText);
 
 			return {
 				...(result as Record<string, unknown>),
-				details: { path: absPath, diff, diffTruncated: truncated },
+				details: { path: absPath, diff, diffTruncated: truncated, diffAdditions: additions, diffRemovals: removals },
 			};
 		},
 
@@ -416,7 +439,9 @@ function registerWriteDiff(pi: { registerTool: (t: unknown) => void }) {
 		},
 
 		renderResult(result: any, options: { expanded: boolean; isPartial: boolean }, theme: any, context: any) {
-			const details = result?.details as { diff?: string; diffTruncated?: boolean } | undefined;
+			const details = result?.details as
+				| { diff?: string; diffTruncated?: boolean; diffAdditions?: number; diffRemovals?: number }
+				| undefined;
 			const diff = details?.diff ?? "";
 			if (!diff) {
 				// New file or no-op: keep pi's own result rendering (it clears the
@@ -431,13 +456,9 @@ function registerWriteDiff(pi: { registerTool: (t: unknown) => void }) {
 			}
 
 			const lines = diff.split("\n");
-			let additions = 0;
-			let removals = 0;
-			for (const line of lines) {
-				if (line.startsWith("+++") || line.startsWith("---")) continue;
-				if (line.startsWith("+")) additions++;
-				if (line.startsWith("-")) removals++;
-			}
+			const counted = countDiffLines(lines);
+			const additions = details?.diffAdditions ?? counted.additions;
+			const removals = details?.diffRemovals ?? counted.removals;
 
 			let text = theme.fg("success", `+${additions}`);
 			text += theme.fg("dim", " / ");
@@ -527,6 +548,14 @@ function renderDiffBody(diffText: string, absPath: string | undefined, theme: an
 		let i = 0;
 
 		while (i < lines.length) {
+			if (lines[i].kind === "gap") {
+				// The marker a truncated diff carries; without this branch the tail of
+				// the diff would sit right under its head, looking like one diff (2026-10-08).
+				out.push(theme.fg("dim", lines[i].text));
+				i++;
+				continue;
+			}
+
 			if (lines[i].kind === " ") {
 				out.push(` ${newLine(lines[i].text, b)}`);
 				b++;

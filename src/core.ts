@@ -1223,9 +1223,50 @@ export function sequentialDiffs(original: string[], resolved: ResolvedHunk[]): s
 	return diffs;
 }
 
-export function truncateDiff(diff: string, max = MAX_DIFF_CHARS): { text: string; truncated: boolean } {
-	if (diff.length <= max) return { text: diff, truncated: false };
-	return { text: diff.slice(0, max) + "\n… (diff truncated)", truncated: true };
+/** Trim a diff for the transcript, keeping BOTH ends. A whole-file rewrite is one
+ * block of removals followed by one block of additions, so cutting the head only
+ * showed a wall of "-" lines with nothing to see (2026-10-08: every big `write`
+ * rendered that way). The reported counts describe the FULL diff, never the
+ * excerpt — the card header used to read "+0 / -212" for a rewritten file. */
+export function truncateDiff(
+	diff: string,
+	max = MAX_DIFF_CHARS,
+): { text: string; truncated: boolean; omitted: number; additions: number; removals: number } {
+	const lines = diff.split("\n");
+	let additions = 0;
+	let removals = 0;
+	for (const line of lines) {
+		if (line.startsWith("+++") || line.startsWith("---")) continue;
+		if (line.startsWith("+")) additions++;
+		else if (line.startsWith("-")) removals++;
+	}
+	if (diff.length <= max) return { text: diff, truncated: false, omitted: 0, additions, removals };
+
+	const headBudget = Math.floor(max * 0.6);
+	const tailBudget = max - headBudget;
+	let headEnd = 0;
+	let used = 0;
+	while (headEnd < lines.length) {
+		const cost = lines[headEnd].length + 1;
+		if (used + cost > headBudget) break;
+		used += cost;
+		headEnd++;
+	}
+	let tailStart = lines.length;
+	used = 0;
+	while (tailStart > headEnd) {
+		const cost = lines[tailStart - 1].length + 1;
+		if (used + cost > tailBudget) break;
+		used += cost;
+		tailStart--;
+	}
+	const omitted = lines.length - headEnd - (lines.length - tailStart);
+	const text = [
+		...lines.slice(0, headEnd),
+		`… (${omitted} diff lines omitted) …`,
+		...lines.slice(tailStart),
+	].join("\n");
+	return { text, truncated: true, omitted, additions, removals };
 }
 
 export interface EditOutcome {
@@ -1481,7 +1522,11 @@ export function unifiedDiff(oldText: string, newText: string, filePath: string, 
 // Unified-diff parsing + word-level diff (for syntax-highlighted diff rendering)
 // ---------------------------------------------------------------------------
 
-export type DiffLineKind = " " | "-" | "+";
+/** "gap" is the omission marker a truncated diff carries ("… (12 diff lines
+ * omitted) …"). It is a line kind of its own so the renderer draws it dim
+ * instead of dropping it: silently jumping from the head of the diff to its tail
+ * looks like a complete (and wrong) diff. */
+export type DiffLineKind = " " | "-" | "+" | "gap";
 
 export interface ParsedDiffLine {
 	kind: DiffLineKind;
@@ -1514,6 +1559,10 @@ export function parseUnifiedDiff(diffText: string): ParsedHunk[] {
 		}
 		if (current === undefined) continue;
 		if (line.startsWith("\\")) continue;
+		if (line.startsWith("… (")) {
+			current.lines.push({ kind: "gap", text: line });
+			continue;
+		}
 		const kind = line[0];
 		if (kind !== " " && kind !== "-" && kind !== "+") continue;
 		current.lines.push({ kind: kind as DiffLineKind, text: line.slice(1) });

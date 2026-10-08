@@ -23,6 +23,7 @@ import {
 	insertTip,
 	headerlessSingleHunk,
 	appliedLine,
+	truncateDiff,
 	openingDelimiterDiagnosis,
 	isEmptyHunk,
 } from "../src/core.ts";
@@ -859,6 +860,39 @@ test("report: the applied line mirrors the rejection line", () => {
 	assert.equal(appliedLine(1, 1), "applied — 1 of 1 hunk, file written");
 	// a no-op hunk was skipped: applied < total is the loud part
 	assert.equal(appliedLine(1, 3), "applied — 1 of 3 hunks, file written");
+});
+
+test("truncate: a whole-file rewrite keeps both ends and full-diff counts", () => {
+	// the shape that produced a wall of "-" lines in the transcript (2026-10-08):
+	// one block of removals, then one block of additions
+	const diff = [
+		"--- a/x.py",
+		"+++ b/x.py",
+		...Array.from({ length: 400 }, (_, i) => `-old line ${i}`),
+		...Array.from({ length: 400 }, (_, i) => `+new line ${i}`),
+	].join("\n");
+	const t = truncateDiff(diff, 500);
+	assert.equal(t.truncated, true);
+	assert.equal(t.removals, 400); // counts describe the FULL diff, not the excerpt
+	assert.equal(t.additions, 400);
+	assert.match(t.text, /-old line 0/);        // head: removals are visible
+	assert.match(t.text, /\+new line 399/);     // tail: additions are visible
+	assert.match(t.text, /diff lines omitted/);
+	assert.ok(t.text.length < 700, `excerpt too long: ${t.text.length}`);
+	const kept = t.text.split("\n").length - 1; // minus the marker line
+	assert.equal(t.omitted, diff.split("\n").length - kept);
+
+	// the excerpt's marker survives as its own line kind, so the renderer can draw
+	// it dim instead of silently joining the head to the tail
+	const parsed = parseUnifiedDiff(`@@ -1,3 +1,3 @@\n context\n-old\n+new\n${t.text.split("\n").find((l) => l.includes("omitted")) ?? ""}`);
+	assert.ok(parsed.some((h) => h.lines.some((l) => l.kind === "gap")), "the omission marker must parse as a gap line");
+
+	// short diffs are untouched, and the counts are still exact
+	const small = truncateDiff("--- a/x\n+++ b/x\n-a\n+b\n");
+	assert.equal(small.truncated, false);
+	assert.equal(small.additions, 1);
+	assert.equal(small.removals, 1);
+	assert.equal(small.omitted, 0);
 });
 
 test("delimiter: patchDelimiter returns the call's run", () => {

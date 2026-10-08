@@ -156,7 +156,7 @@ function f() {
 
 ## Rendering
 
-The UI draws the change as a unified diff with word-level highlighting (`details.diff`). The transcript card shows that diff plus a compact `+adds / -removals · N hunks` line — the per-hunk report, the anchor caveats and the shorter-form tip are written for the model and are **not** drawn next to the diff (Nik, 2026-10-01: "только сам дифф"). The model-facing content stays a summary, because models that see raw diffs in tool output start imitating the diff format in their own patches (this happened, and is why the escaping and diff-style diagnostics above exist).
+The UI draws the change as a unified diff with word-level highlighting (`details.diff`). A diff too large for the card keeps **both ends** — the head, a dim `… (N diff lines omitted) …` marker, and the tail — and the `+adds / -removals` counts always describe the whole diff, never the excerpt (2026-10-08: a rewritten file rendered as a wall of `-` lines with `+0` in the header). The transcript card shows that diff plus a compact `+adds / -removals · N hunks` line — the per-hunk report, the anchor caveats and the shorter-form tip are written for the model and are **not** drawn next to the diff (Nik, 2026-10-01: "только сам дифф"). The model-facing content stays a summary, because models that see raw diffs in tool output start imitating the diff format in their own patches (this happened, and is why the escaping and diff-style diagnostics above exist).
 A failed call draws its **error text** instead: a patch rejection carries the whole diagnosis there, and rendering the empty result showed "+0 / -0 · 0 hunks", hiding the reason (2026-10-07).
 
 
