@@ -724,6 +724,11 @@ test("chain: even chain yields a numbered skeleton, no auto-apply", () => {
 	assert.match(sk, /5 @@@/);        // e sits at line 5
 	assert.match(sk, /your before block: 1 line . it sits at src 2-2/);
 	assert.match(sk, /Rules:/);
+	// The rules must describe the annotations the skeleton actually emits
+	// ("<...>" placeholders). It once said 'remove the "<- note" annotations',
+	// left over from the first implementation: nothing ever printed that.
+	assert.match(sk, /Replace every "<\.\.\.>" placeholder/);
+	assert.doesNotMatch(sk, /<- note/);
 	assert.equal(file.join("\n"), "a\nb\nc\nd\ne\nf\ng"); // file untouched
 });
 

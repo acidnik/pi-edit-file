@@ -420,7 +420,7 @@ export function chainSkeleton(patch: string, fileLines: string[]): string {
 	out.push(
 		`Rules: the header is "NNN ${delimRun}" — the line where the old block starts; "+" after the number inserts AFTER that line (inserts only); ` +
 			`inserts have an empty before-block (header line, then the delimiter line, then the new lines); a delete is an empty after-block. ` +
-			`Remove the "<- note" annotations — they are explanations, not patch lines.`,
+			`Replace every "<...>" placeholder (including "<NOT UNIQUE …>" / "<NOT FOUND …>", after fixing that block) with your own lines — the angle brackets are explanations, not patch text.`,
 	);
 	return out.join("\n");
 }
