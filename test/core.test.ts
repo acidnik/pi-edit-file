@@ -23,6 +23,8 @@ import {
 	insertTip,
 	headerlessSingleHunk,
 	appliedLine,
+	openingDelimiterDiagnosis,
+	isEmptyHunk,
 } from "../src/core.ts";
 
 const FILE = [
@@ -78,8 +80,15 @@ test("parse: a foreign-char delimiter run is legal content (exact-run matching)"
 test("parse: grammar errors", () => {
 	assert.throws(() => parsePatch("no header here"), EditError);
 	assert.throws(() => parsePatch("1 @@@\nunterminated"), EditError);
-	assert.throws(() => parsePatch("1 @@@\n@@@"), EditError); // empty hunk
 	assert.throws(() => parsePatch(""), EditError); // no hunks
+});
+
+test("parse: an empty hunk parses, and fails at resolve time with its own reason", () => {
+	// kept through the parser so a batch can skip it with a note (the extension does)
+	const hunks = parsePatch("1 @@@\n@@@");
+	assert.equal(hunks.length, 1);
+	assert.equal(isEmptyHunk(hunks[0]), true);
+	assert.throws(() => runPatch("1 @@@\n@@@", toLines("a\nb")), /empty hunk — no before-block and no after-block/);
 });
 
 test("parse: @@@ inside a content line is not a delimiter", () => {
@@ -978,6 +987,36 @@ test("headerless: the helper stays out when the reading is not unambiguous", () 
 	assert.equal(headerlessSingleHunk(`${D}\nb\n${D}\nB\n${D}`), null);     // leading bare delimiter: already legal
 	assert.equal(headerlessSingleHunk(`b\n2 ${D}\nB`), null);               // numbered header present
 	assert.equal(headerlessSingleHunk(`   \n${D}\nnew`), null);             // nothing to anchor on
+});
+
+test("opening delimiter: a one-hunk body without its header gets a precise diagnosis", () => {
+	const msg = openingDelimiterDiagnosis(`old line\n${D}\nnew line\n${D}`);
+	assert.match(msg ?? "", /the opening delimiter line is missing/);
+	assert.match(msg ?? "", new RegExp(`${D}\\nold lines\\n${D}\\nnew lines\\n${D}`));
+	assert.match(msg ?? "", new RegExp(`NNN ${D}\\nold lines`));
+	assert.doesNotMatch(msg ?? "", /chain form|your before block|your after block/);
+});
+
+test("opening delimiter: only the single-hunk shape is called out", () => {
+	assert.equal(openingDelimiterDiagnosis(`old\n${D}\nnew`), null);                    // 1 delimiter: accepted upstream
+	assert.equal(openingDelimiterDiagnosis(`a\n${D}\nb\n${D}\nc\n${D}\nd`), null); // 3 delimiters: a chain
+	assert.equal(openingDelimiterDiagnosis(`a\n${D}\nb\n${D}\nc`), null);             // content after the 2nd
+	assert.equal(openingDelimiterDiagnosis(`a\n${D}\nb\n${D}\n3 @@@\nc\n${D}\nd`), null); // numbered header somewhere
+	assert.equal(openingDelimiterDiagnosis(`a\n@@@\nb\n####`), null);                  // mixed runs: the parser's business
+});
+
+test("chain: a situation line replaces the content-first preamble", () => {
+	const sk = chainSkeleton(`b\n${D}\nB\n${D}`, toLines("a\nb\nc"), "the hunk header is there, but a delimiter line is missing inside the patch.");
+	assert.match(sk, /^the hunk header is there, but a delimiter line is missing inside the patch\./);
+	assert.doesNotMatch(sk, /opens with content/);
+	assert.match(sk, /A block that occurs exactly once in the file needs no number/);
+});
+
+test("chain: NOT FOUND names the closest line by similarity", () => {
+	const file = toLines("alpha = 1\nbeta = 2\ngamma = 3\n");
+	const sk = chainSkeleton(`alfa = 1\n${D}\nALPHA = 9\n${D}`, file);
+	assert.match(sk, /NOT FOUND/);
+	assert.match(sk, /closest line 1 \(\d+% similar\): "alpha = 1"/);
 });
 
 test("chain: the rejection no longer claims a block count it cannot know", () => {

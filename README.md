@@ -128,10 +128,12 @@ Not-found is the most expensive failure because it is the one models retry blind
 | Typo in one character (`1000` → `1001`) | `closest line 2 (95% similar): "const timeout = 1000;"` |
 | Hand-written `\n` inside a line | `Escaping note: a literal "\n" in a before-line is a backslash followed by "n", not a line break …` |
 | Block occurs more than once in the file | `not unique — the before-block matches at lines 12, 45 (exact match, 2 copies)` + *include more surrounding lines … a line number cannot choose between identical blocks* |
-| Every hunk is a no-op (`before == after`) | `nothing applied — every hunk of this patch is a no-op …, so the file was NOT written` |
+| Every hunk is a no-op (`before == after`) or empty (`@@@` with nothing on either side) | `nothing applied — every hunk of this patch is empty or a no-op …`; inside a batch each one is `SKIPPED — no-op …` / `SKIPPED — empty hunk …` and the rest still applies |
 | No hunk header at all (chain form), a header where the closing delimiter belongs, or an unterminated hunk | the blocks are located in the file and re-emitted as a ready-to-paste numbered skeleton (`NOT UNIQUE` / `NOT FOUND` placeholders when a block cannot be pinned), with the note that a single unique block may start with a bare delimiter line instead of a number |
+| **One hunk whose opening delimiter line was left out** (`old` / delim / `new` / delim) | not called a chain: `the opening delimiter line is missing … Only that first line is missing`, with both legal forms spelled out and no placeholders (24 of 27 rejections in one session were this shape) |
+| Closing delimiter missing inside the patch | the skeleton's preamble says so — `the hunk header is there, but a "@@@" line is missing inside the patch` — instead of claiming the patch opened with content |
 
-Grammar failures get the same treatment as not-found ones: the patch is never applied, and the reply rebuilds the model's own blocks into legal form instead of stopping at a parse error. Not-found failures also include the nearest candidate region with per-line `=` / `≠` markers, and a **ready-to-paste corrected hunk** built from the real file content:
+Grammar failures get the same treatment as not-found ones: the patch is never applied, and the reply rebuilds the model's own blocks into legal form instead of stopping at a parse error. A block that is nowhere in the file is reported with its closest line by similarity (`closest line N (87% similar)`), in both the not-found diagnosis and the rebuilt skeleton. Not-found failures also include the nearest candidate region with per-line `=` / `≠` markers, and a **ready-to-paste corrected hunk** built from the real file content:
 
 ```
 Closest candidate: lines 2-4 — 2 of 3 line(s) match.

@@ -43,6 +43,8 @@ import {
 	reportCaveats,
 	insertTip,
 	appliedLine,
+	openingDelimiterDiagnosis,
+	isEmptyHunk,
 } from "./core.ts";
 
 const TOOL_NAME = "edit_file";
@@ -165,30 +167,45 @@ export default function editFileExtension(pi: { registerTool: (t: unknown) => vo
 					// blocks on. Without one (only "NNN @@@" headers, no standalone
 					// delimiter line) its fallback text is the generic "no delimiter
 					// found" — then the precise diagnosis alone is more useful.
-					const grammarError = err.code === "content-start" || err.code === "missing-separator" || err.code === "unterminated";
-					if (grammarError && (err.code === "content-start" || patchDelimiter(params.patch) !== null)) {
-						const skeleton = chainSkeleton(params.patch, readLines(absPath).lines);
-						const diagnosis = err.code === "content-start" ? "" : `${err.message}\n\n`;
-						throw new EditError(`patch rejected — nothing was written to the file.\n${diagnosis}${skeleton}`);
+					// A patch that opens with content gets a reply built from its own
+					// blocks. When it is ONE hunk missing only its opening delimiter line
+					// (the shape models reach for again and again), the diagnosis is
+					// precise and placeholder-free; a real chain gets the rebuilt skeleton.
+					if (err.code === "content-start") {
+						const precise = openingDelimiterDiagnosis(params.patch);
+						const body = precise ?? chainSkeleton(params.patch, readLines(absPath).lines);
+						throw new EditError(`patch rejected — nothing was written to the file.\n${body}`);
+					}
+					// A delimiter line inside the patch is missing: the skeleton is right,
+					// but its preamble must describe THIS failure — it used to claim the
+					// patch opened with content even when the header was there.
+					const delim = patchDelimiter(params.patch);
+					if ((err.code === "missing-separator" || err.code === "unterminated") && delim !== null) {
+						const situation = `the hunk header is there, but a "${delim}" line is missing inside the patch — every block needs its closing "${delim}" line.`;
+						const skeleton = chainSkeleton(params.patch, readLines(absPath).lines, situation);
+						throw new EditError(`patch rejected — nothing was written to the file.\n${err.message}\n\n${skeleton}`);
 					}
 					throw new EditError(`patch rejected — nothing was written to the file.\n${err.message}`);
 				}
 				throw err;
 			}
 
-			// No-op hunks (before == after, exact) carry no change at all. Inside a
-			// batch each is skipped with a loud note; a patch made ONLY of them is
-			// rejected — such a patch means the author copied the wrong lines, and
-			// that signal must never come back as a success (Nik, 2026-10-02).
+			// Hunks that change nothing are skipped inside a batch, each with a loud
+			// note: no-ops (before == after) and empty ones (both blocks blank, usually
+			// stray delimiter lines after a terminator — one such hunk used to reject
+			// the whole batch). A patch made ONLY of them is rejected: that patch means
+			// the author copied the wrong lines, and such a signal must never come back
+			// as a success (Nik, 2026-10-02).
 			const active: Array<{ hunk: Hunk; origIndex: number }> = [];
 			const noOpNotes: string[] = [];
 			parsed.forEach((h, i) => {
-				if (isNoOpHunk(h)) noOpNotes.push(`hunk ${i + 1}: SKIPPED — no-op (the old block equals the new block); this hunk changes nothing`);
+				if (isEmptyHunk(h)) noOpNotes.push(`hunk ${i + 1}: SKIPPED — empty hunk (no old block, no new block); this hunk changes nothing`);
+				else if (isNoOpHunk(h)) noOpNotes.push(`hunk ${i + 1}: SKIPPED — no-op (the old block equals the new block); this hunk changes nothing`);
 				else active.push({ hunk: h, origIndex: i });
 			});
 			if (active.length === 0) {
 				throw new EditError(
-					`nothing applied — every hunk of this patch is a no-op (the old block equals the new block), so the file was NOT written.\n` +
+					`nothing applied — every hunk of this patch is empty or a no-op (it changes nothing), so the file was NOT written.\n` +
 						`${noOpNotes.join("\n")}\n` +
 						`Check that the old block is the text you mean to replace, and that the new block differs from it.`,
 				);

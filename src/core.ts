@@ -274,9 +274,10 @@ export function parsePatch(patch: string): Hunk[] {
 			if (hint < 1) throw new EditError("insert-after needs NNN >= 1");
 		}
 
-		if (before.length === 0 && after.length === 0) {
-			throw new EditError(`hunk ${hunks.length + 1} (${hintLabel(hint)}) is empty: both before and after blocks are blank`);
-		}
+		// An empty hunk (both blocks blank — usually a stray delimiter pair after a
+		// terminator) is kept rather than rejected here: inside a batch the tool
+		// skips it with a note, like a no-op, and only a patch that is nothing but
+		// empty/no-op hunks is an error (Nik, 2026-10-08).
 		hunks.push({ hint, before, after, ...(header.insertAfter ? { insertAfter: true } : {}) });
 
 		if (terminated && i < lines.length && lines[i].trim() === "" && i === lines.length - 1) {
@@ -320,7 +321,7 @@ function locateBlock(fileLines: string[], before: string[]): { status: "ok"; lin
 /** Skeleton for a chain patch; fileLines are needed to number the headers.
  * Always returns model-facing text — the file is never written from a chain
  * patch; the model re-emits the skeleton with its own blocks. */
-export function chainSkeleton(patch: string, fileLines: string[]): string {
+export function chainSkeleton(patch: string, fileLines: string[], situation?: string): string {
 	const lines = patch.split("\n");
 	if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
 
@@ -373,7 +374,8 @@ export function chainSkeleton(patch: string, fileLines: string[]): string {
 	}
 
 	const out: string[] = [
-		`the patch opens with content instead of a hunk header, and the chain form ("old ${delimRun} new ${delimRun} old ${delimRun} new") is not legal input — every block needs its own header.`,
+		situation ??
+			`the patch opens with content instead of a hunk header, and the chain form ("old ${delimRun} new ${delimRun} old ${delimRun} new") is not legal input — every block needs its own header.`,
 		`A block that occurs exactly once in the file needs no number: start the patch with a bare "${delimRun}" line.`,
 		"Here is the same edit with the headers filled in — paste your blocks between the header and delimiter lines:",
 		"",
@@ -405,7 +407,15 @@ export function chainSkeleton(patch: string, fileLines: string[]): string {
 				const more = loc.lines.length > 5 ? ` … and ${loc.lines.length - 5} more` : "";
 				headerLine = `<NOT UNIQUE: this before-block matches at lines ${capped.join(", ")}${more} — extend the before-block with surrounding lines to make it unique, then re-emit with the chosen NNN>`;
 			} else {
-				headerLine = `<NOT FOUND: this before-block does not appear in the file (exact, trimmed and whitespace-collapsed matching all failed) — re-read the file and copy the lines exactly>`;
+				// Symmetry with the not-found diagnosis: when the block is nowhere in the
+				// file, name the closest line by similarity too instead of only saying
+				// "re-read the file" (2026-10-08 feedback).
+				const distinctive = before.lines.reduce((best, l) => (l.trim().length > best.trim().length ? l : best), before.lines[0] ?? "");
+				const near = distinctive ? closestLine(fileLines, distinctive, before.hint ?? 1) : undefined;
+				const nearText = near
+					? ` — closest line ${near.index + 1} (${Math.round(near.similarity * 100)}% similar): ${JSON.stringify(near.text)}`
+					: "";
+				headerLine = `<NOT FOUND: this before-block does not appear in the file (exact, trimmed and whitespace-collapsed matching all failed)${nearText} — re-read the file and copy the lines exactly>`;
 			}
 		}
 		out.push(headerLine);
@@ -425,6 +435,37 @@ export function chainSkeleton(patch: string, fileLines: string[]): string {
 	return out.join("\n");
 }
 
+/** A patch that opens with content and holds exactly the delimiter lines of ONE
+ * hunk (its body plus the optional terminator) is not a chain: it is a single
+ * hunk whose opening delimiter line was left out. That shape gets called out
+ * precisely, with both legal forms spelled out and no placeholder skeleton —
+ * the chain-form diagnosis sent the model fixing a problem it did not have, and
+ * 24 of 27 rejections in one session were exactly this (2026-10-08). The
+ * one-delimiter variant of the same shape is accepted by headerlessSingleHunk(). */
+export function openingDelimiterDiagnosis(patch: string): string | null {
+	const lines = patch.split("\n");
+	if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+	// A numbered header anywhere means the author knows about headers — that is a
+	// mixed/chain patch, and the rebuilt skeleton with real numbers serves it.
+	if (lines.some((line) => HEADER_RE.test(line))) return null;
+
+	const runs = lines.map((line) => delimiterRun(line));
+	const at: number[] = [];
+	for (let i = 0; i < runs.length; i++) if (runs[i] !== null) at.push(i);
+	if (at.length !== 2) return null; // 1 delimiter: accepted; 0 or ≥3: no single-hunk reading
+	const run = runs[at[0]];
+	if (runs[at[1]] !== run) return null; // mixed runs: let the parser complain about that
+	if (!lines.slice(at[1] + 1).every((l) => l.trim() === "")) return null; // content after the 2nd: a chain
+
+	return (
+		`the patch opens with content instead of a hunk header — the opening delimiter line is missing (the blocks themselves are fine).\n` +
+		`A hunk carries that line in front:\n\n` +
+		`${run}\nold lines\n${run}\nnew lines\n${run}\n\n` +
+		`or, with a line-number hint instead of the bare first line:\n\n` +
+		`NNN ${run}\nold lines\n${run}\nnew lines\n${run}\n\n` +
+		`Only that first line is missing — the rest of the patch is already in the right shape.`
+	);
+}
 const exactEq: LineEq = (a, b) => a === b;
 const trimEq: LineEq = (a, b) => a.trim() === b.trim();
 const collapseEq: LineEq = (a, b) => a.replace(/\s+/g, " ").trim() === b.replace(/\s+/g, " ").trim();
@@ -705,6 +746,20 @@ export interface ResolveReport {
 function resolveOne(hunk: Hunk, fileLines: string[], index: number): { ok: ResolvedHunk } | { fail: HunkFailure } {
 	const hint = hunk.hint;
 	const kind: HunkKind = hunk.before.length === 0 ? "insert" : hunk.after.length === 0 ? "delete" : "replace";
+
+	// Both blocks blank: nothing to change. The extension skips these inside a
+	// batch, so reaching here means the patch was nothing but skipped hunks.
+	if (isEmptyHunk(hunk)) {
+		return {
+			fail: {
+				index,
+				hint,
+				kind,
+				reason: "empty hunk — no before-block and no after-block, so there is nothing to change (stray delimiter lines?)",
+				detail: "",
+			},
+		};
+	}
 
 	if (hunk.before.length === 0) {
 		if (hint === null) {
@@ -1272,6 +1327,12 @@ export function insertTip(resolved: ResolvedHunk[], numbers?: number[], delim = 
  * (exact): applying it changes nothing, so it is skipped with a note instead
  * of killing the batch or silently doing busywork. Trim-equal blocks still
  * apply — whitespace normalization is a real change. */
+/** A hunk with nothing on either side — usually stray delimiter lines after a
+ * terminator. Skipped inside a batch; a patch made only of these is an error. */
+export function isEmptyHunk(h: Hunk): boolean {
+	return h.before.length === 0 && h.after.length === 0;
+}
+
 export function isNoOpHunk(h: Hunk): boolean {
 	return h.before.length > 0 && h.before.length === h.after.length && h.before.every((l, i) => l === h.after[i]);
 }
